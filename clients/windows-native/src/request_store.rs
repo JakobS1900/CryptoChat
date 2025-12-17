@@ -193,3 +193,45 @@ pub fn get_contact(fingerprint: &str) -> Result<Option<Contact>> {
         .into_iter()
         .find(|c| c.fingerprint == fingerprint))
 }
+
+// ============ Chat History ============
+
+/// Stored chat message for persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredMessage {
+    pub sender_name: String,
+    pub content: String,
+    pub is_mine: bool,
+    pub timestamp: String,
+}
+
+/// Get path to chat_history.json
+fn get_history_path() -> Result<PathBuf> {
+    Ok(get_data_dir()?.join("chat_history.json"))
+}
+
+/// Load chat history from disk
+pub fn load_chat_history() -> Result<Vec<StoredMessage>> {
+    let path = get_history_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let json = fs::read_to_string(&path).context("Failed to read chat history")?;
+    let messages: Vec<StoredMessage> = serde_json::from_str(&json).unwrap_or_default();
+    Ok(messages)
+}
+
+/// Save chat history to disk
+pub fn save_chat_history(messages: &[StoredMessage]) -> Result<()> {
+    let path = get_history_path()?;
+    let json = serde_json::to_string_pretty(messages)?;
+    fs::write(&path, json).context("Failed to save chat history")?;
+    Ok(())
+}
+
+/// Append a message to chat history
+pub fn append_message(msg: &StoredMessage) -> Result<()> {
+    let mut history = load_chat_history().unwrap_or_default();
+    history.push(msg.clone());
+    save_chat_history(&history)
+}

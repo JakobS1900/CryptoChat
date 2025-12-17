@@ -41,6 +41,11 @@ impl AppState {
             .map(|kp| kp.fingerprint())
     }
 
+    /// Get a clone of the keypair for signing operations
+    pub fn get_keypair(&self) -> Option<PgpKeyPair> {
+        self.keypair.read().unwrap().clone()
+    }
+
     pub fn encrypt_message(&self, plaintext: &str) -> anyhow::Result<String> {
         let my_keypair = self.keypair.read().unwrap();
         let recipient_keypair = self.recipient_keypair.read().unwrap();

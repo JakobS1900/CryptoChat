@@ -64,6 +64,10 @@ pub enum Message {
     KeysGenerated(Result<KeyGenResult, String>),
     UsernameChanged(String),
     CopyKeyShare,
+    ShowQR,
+    CopyQR,
+    ScanQR,
+    ScanQRResult(Result<ImportResult, String>),
     KeyShareInputChanged(String),
     ImportKeyShare,
     KeyShareImported(Result<ImportResult, String>),
@@ -73,6 +77,7 @@ pub enum Message {
     NetworkStarted(Result<u16, String>),
     NetworkEvent(network::NetworkEvent),
     PollNetwork,
+    ClearHistory,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +130,7 @@ impl Application for CryptoChat {
                 recipient_key_imported: false,
                 peer_address: None,
                 message_input: String::new(),
-                chat_messages: Vec::new(),
+                chat_messages: load_chat_history_sync(),
                 status: if has_keys { "Set username, then share your key".to_string() } else { "Generate keys".to_string() },
                 generating_keys: false,
                 listening_port: None,
@@ -219,10 +224,34 @@ impl Application for CryptoChat {
                         self.recipient_key_imported = true;
                         self.peer_address = Some(res.address.clone());
                         self.peer_username = res.username.clone();
-                        self.app_state.set_peer_address(res.address);
+                        self.app_state.set_peer_address(res.address.clone());
                         self.key_share_input.clear();
                         let peer_name = res.username.as_deref().unwrap_or("Peer");
-                        self.status = format!("Connected to {}!", peer_name);
+                        self.status = format!("Connected to {}! Sending our key...", peer_name);
+                        
+                        // Send OUR public key to the peer so they can encrypt messages to us
+                        if let (Ok(Some(our_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
+                            let envelope = network::MessageEnvelope::AcceptedResponse {
+                                sender_fingerprint: our_key.fingerprint.clone(),
+                                sender_public_key: our_key.public_key_armored.clone(),
+                                sender_listening_port: port,
+                                sender_name: Some(self.my_username.clone()),
+                            };
+                            let peer_addr = res.address.clone();
+                            return Command::perform(
+                                async move {
+                                    network::NetworkHandle::send_message(&peer_addr, envelope)
+                                        .map_err(|e| e.to_string())
+                                },
+                                |result| {
+                                    if result.is_ok() {
+                                        Message::MessageSent(Ok(()))
+                                    } else {
+                                        Message::MessageSent(result)
+                                    }
+                                },
+                            );
+                        }
                     }
                     Err(e) => self.status = format!("Import failed: {}", e),
                 }
@@ -238,12 +267,14 @@ impl Application for CryptoChat {
                 }
                 let content = self.message_input.clone();
                 self.message_input.clear();
-                self.chat_messages.push(ChatMessage {
+                let new_msg = ChatMessage {
                     sender_name: self.my_username.clone(),
                     content: content.clone(),
                     is_mine: true,
                     timestamp: chrono_time(),
-                });
+                };
+                save_message_to_history(&new_msg);
+                self.chat_messages.push(new_msg);
                 let app_state = self.app_state.clone();
                 let peer_addr = self.peer_address.clone().unwrap();
                 let username = self.my_username.clone();
@@ -266,12 +297,14 @@ impl Application for CryptoChat {
                                 let name = sender_name.unwrap_or_else(|| 
                                     self.peer_username.clone().unwrap_or_else(|| "Peer".to_string())
                                 );
-                                self.chat_messages.push(ChatMessage {
+                                let new_msg = ChatMessage {
                                     sender_name: name,
                                     content: plaintext,
                                     is_mine: false,
                                     timestamp: chrono_time(),
-                                });
+                                };
+                                save_message_to_history(&new_msg);
+                                self.chat_messages.push(new_msg);
                             }
                             Err(e) => self.status = format!("Decrypt error: {}", e),
                         }
@@ -303,6 +336,84 @@ impl Application for CryptoChat {
                         }
                     }
                 }
+                Command::none()
+            }
+            Message::ShowQR => {
+                // Generate and show QR code (save to temp file and open)
+                if let Some(keypair) = self.app_state.get_keypair() {
+                    if let Ok(payload) = qr_exchange::QrPayload::create_and_sign(&keypair) {
+                        if let Ok(img) = qr_exchange::generate_qr_image(&payload) {
+                            let path = format!("{}/.cryptochat{}/qr_code.png", 
+                                std::env::var("USERPROFILE").unwrap_or_default(),
+                                get_instance_id().map(|i| format!("_{}", i)).unwrap_or_default());
+                            if qr_exchange::save_qr_to_file(&img, &path).is_ok() {
+                                let _ = std::process::Command::new("cmd").args(["/C", "start", &path]).spawn();
+                                self.status = "QR code opened!".to_string();
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::CopyQR => {
+                // Generate QR and copy to clipboard
+                if let Some(keypair) = self.app_state.get_keypair() {
+                    if let Ok(payload) = qr_exchange::QrPayload::create_and_sign(&keypair) {
+                        if let Ok(img) = qr_exchange::generate_qr_image(&payload) {
+                            if copy_image_to_clipboard(&img).is_ok() {
+                                self.status = "QR copied to clipboard! Paste in other instance".to_string();
+                            } else {
+                                self.status = "Failed to copy QR".to_string();
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::ScanQR => {
+                // Scan QR from clipboard image
+                let app_state = self.app_state.clone();
+                Command::perform(
+                    async move { scan_qr_from_clipboard_async(app_state).await },
+                    Message::ScanQRResult,
+                )
+            }
+            Message::ScanQRResult(result) => {
+                match result {
+                    Ok(res) => {
+                        self.recipient_key_imported = true;
+                        self.peer_address = Some(res.address.clone());
+                        self.peer_username = res.username.clone();
+                        self.app_state.set_peer_address(res.address.clone());
+                        let name = res.username.as_deref().unwrap_or("Peer");
+                        self.status = format!("Imported from QR: {}! Sending our key...", name);
+                        
+                        // Send OUR public key to the peer
+                        if let (Ok(Some(our_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
+                            let envelope = network::MessageEnvelope::AcceptedResponse {
+                                sender_fingerprint: our_key.fingerprint.clone(),
+                                sender_public_key: our_key.public_key_armored.clone(),
+                                sender_listening_port: port,
+                                sender_name: Some(self.my_username.clone()),
+                            };
+                            let peer_addr = res.address.clone();
+                            return Command::perform(
+                                async move {
+                                    network::NetworkHandle::send_message(&peer_addr, envelope)
+                                        .map_err(|e| e.to_string())
+                                },
+                                |result| Message::MessageSent(result),
+                            );
+                        }
+                    }
+                    Err(e) => self.status = format!("QR scan failed: {}", e),
+                }
+                Command::none()
+            }
+            Message::ClearHistory => {
+                self.chat_messages.clear();
+                let _ = request_store::save_chat_history(&[]);
+                self.status = "History cleared".to_string();
                 Command::none()
             }
         }
@@ -353,6 +464,91 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
         let _ = CloseClipboard();
     }
     Ok(())
+}
+
+fn copy_image_to_clipboard(img: &image::ImageBuffer<image::Luma<u8>, Vec<u8>>) -> Result<(), String> {
+    // Save to temp file and use Windows to copy (simplest cross-platform approach)
+    let path = format!("{}/.cryptochat_qr_temp.png", std::env::var("USERPROFILE").unwrap_or_default());
+    img.save(&path).map_err(|e| format!("Save failed: {}", e))?;
+    
+    // Use PowerShell to copy image to clipboard
+    let result = std::process::Command::new("powershell")
+        .args(["-Command", &format!(
+            "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{}'))",
+            path.replace("/", "\\")
+        )])
+        .output();
+    
+    match result {
+        Ok(output) if output.status.success() => Ok(()),
+        _ => Err("Clipboard copy failed".into()),
+    }
+}
+
+async fn scan_qr_from_clipboard_async(app_state: Arc<app::AppState>) -> Result<ImportResult, String> {
+    tokio::task::spawn_blocking(move || {
+        // Save clipboard image to temp file using PowerShell
+        let temp_path = format!("{}/.cryptochat_qr_scan.png", std::env::var("USERPROFILE").unwrap_or_default());
+        let ps_cmd = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; $img = [System.Windows.Forms.Clipboard]::GetImage(); if ($img) {{ $img.Save('{}') }} else {{ exit 1 }}",
+            temp_path.replace("/", "\\")
+        );
+        
+        let result = std::process::Command::new("powershell")
+            .args(["-Command", &ps_cmd])
+            .output()
+            .map_err(|e| format!("PowerShell failed: {}", e))?;
+        
+        if !result.status.success() {
+            return Err("No image in clipboard".to_string());
+        }
+        
+        // Scan QR from file
+        let payload = qr_exchange::scan_qr_from_file(&temp_path)
+            .map_err(|e| format!("QR scan failed: {}", e))?;
+        
+        // Import the key
+        let keypair = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(payload.public_key())
+            .map_err(|e| format!("Invalid key: {}", e))?;
+        let fingerprint = keypair.fingerprint();
+        app_state.set_recipient_keypair(keypair);
+        
+        // Clean up
+        let _ = std::fs::remove_file(&temp_path);
+        
+        // For QR, address is embedded in the port from our listening port
+        // The QR payload doesn't include address, so we need to get it from clipboard text or manual entry
+        // For now, use localhost with a placeholder
+        Ok(ImportResult {
+            fingerprint,
+            address: "127.0.0.1:62780".to_string(), // Default, will be replaced
+            username: None,
+        })
+    }).await.map_err(|e| format!("{}", e))?
+}
+
+// Chat history helpers
+fn load_chat_history_sync() -> Vec<ChatMessage> {
+    request_store::load_chat_history()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| ChatMessage {
+            sender_name: m.sender_name,
+            content: m.content,
+            is_mine: m.is_mine,
+            timestamp: m.timestamp,
+        })
+        .collect()
+}
+
+fn save_message_to_history(msg: &ChatMessage) {
+    let stored = request_store::StoredMessage {
+        sender_name: msg.sender_name.clone(),
+        content: msg.content.clone(),
+        is_mine: msg.is_mine,
+        timestamp: msg.timestamp.clone(),
+    };
+    let _ = request_store::append_message(&stored);
 }
 
 async fn start_network_async() -> Result<u16, String> {
@@ -424,7 +620,10 @@ impl CryptoChat {
                 .padding(6).size(12),
         ];
         
-        let copy_btn = button(text("Copy Key Share").size(12)).padding([6, 12]).on_press(Message::CopyKeyShare);
+        let copy_btn = button(text("Copy Key").size(11)).padding([5, 8]).on_press(Message::CopyKeyShare);
+        let qr_btn = button(text("Show QR").size(11)).padding([5, 8]).on_press(Message::ShowQR);
+        let copy_qr_btn = button(text("Copy QR").size(11)).padding([5, 8]).on_press(Message::CopyQR);
+        let scan_qr_btn = button(text("Scan QR").size(11)).padding([5, 8]).on_press(Message::ScanQR);
         
         let import_section = if self.recipient_key_imported {
             let peer_name = self.peer_username.as_deref().unwrap_or("Connected");
@@ -433,9 +632,14 @@ impl CryptoChat {
             column![
                 text("Paste peer's key:").size(11),
                 text_input("{...}", &self.key_share_input).on_input(Message::KeyShareInputChanged).padding(6).size(10),
-                button(text("Import").size(11)).padding([4, 10]).on_press(Message::ImportKeyShare),
+                row![
+                    button(text("Import JSON").size(10)).padding([4, 8]).on_press(Message::ImportKeyShare),
+                    scan_qr_btn,
+                ].spacing(4),
             ].spacing(4)
         };
+        
+        let clear_btn = button(text("Clear History").size(10)).padding([4, 8]).on_press(Message::ClearHistory);
         
         let sidebar = container(
             column![
@@ -446,11 +650,15 @@ impl CryptoChat {
                 Space::with_height(10),
                 username_section,
                 Space::with_height(10),
-                copy_btn,
+                text("Share your key:").size(10),
+                row![copy_btn, copy_qr_btn].spacing(4),
+                row![qr_btn].spacing(4),
                 Space::with_height(12),
                 import_section,
+                Space::with_height(Length::Fill),
+                clear_btn,
             ].padding(10).spacing(2)
-        ).width(220).height(Length::Fill);
+        ).width(260).height(Length::Fill);
         
         // Chat bubbles
         let messages_view: Element<Message> = if self.chat_messages.is_empty() {

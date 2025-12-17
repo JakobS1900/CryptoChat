@@ -1,0 +1,71 @@
+        onboarding::ID_BUTTON_SCAN_QR => {
+            // Prompt user for QR code file path
+            // We use a simple MessageBox approach since proper file dialogs require COM initialization
+            let instructions = "To scan a QR code:\n\n\
+                1. Take a screenshot of the QR code\n\
+                2. Save it to a known location (e.g., Desktop)\n\
+                3. Paste the public key manually for now\n\n\
+                Full file dialog coming soon!";
+            
+            let instructions_wide: Vec<u16> = instructions.encode_utf16().chain(std::iter::once(0)).collect();
+            
+            if MessageBoxW(
+                hwnd,
+                PCWSTR(instructions_wide.as_ptr()),
+                w!("QR Code Scanning"),
+                MB_OKCANCEL | MB_ICONINFORMATION
+            ).0 == IDOK.0 {
+                // Try to scan from a default location (Desktop\cryptochat_qr_scan.png)
+                let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\Users\Public".to_string());
+                let default_path = format!("{}\Desktop\cryptochat_qr_scan.png", home);
+                
+                match crate::qr_exchange::scan_qr_from_file(&default_path) {
+                    Ok(payload) => {
+                        // Parse and store the public key
+                        match PgpKeyPair::from_public_key(payload.public_key()) {
+                            Ok(recipient_keypair) => {
+                                let fingerprint = recipient_keypair.fingerprint();
+                                
+                                if let Some(app_state) = crate::get_app_state() {
+                                    app_state.set_recipient_keypair(recipient_keypair);
+                                }
+                                
+                                let success_msg = format!(
+                                    "✓ QR code scanned successfully!\n\nFingerprint:\n{}\n\nThe signature was cryptographically verified.",
+                                    crate::qr_exchange::format_fingerprint(&fingerprint)
+                                );
+                                let success_wide: Vec<u16> = success_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                MessageBoxW(hwnd, PCWSTR(success_wide.as_ptr()),
+                                           w!("Success"), MB_OK | MB_ICONINFORMATION);
+                                
+                                // Show peer address input
+                                if let Ok(label) = GetDlgItem(hwnd, onboarding::ID_LABEL_PEER_ADDRESS as i32) {
+                                    ShowWindow(label, SW_SHOW);
+                                }
+                                if let Ok(input) = GetDlgItem(hwnd, onboarding::ID_EDIT_PEER_ADDRESS as i32) {
+                                    ShowWindow(input, SW_SHOW);
+                                }
+                                if let Ok(btn) = GetDlgItem(hwnd, onboarding::ID_BUTTON_START_CHAT as i32) {
+                                    ShowWindow(btn, SW_SHOW);
+                                }
+                            }
+                            Err(e) => {
+                                let error_msg = format!("Failed to parse public key: {}", e);
+                                let error_wide: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                MessageBoxW(hwnd, PCWSTR(error_wide.as_ptr()),
+                                           w!("Error"), MB_OK | MB_ICONERROR);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = format!(
+                            "Could not find QR code at:\n{}\n\nError: {}\n\nPlease save your QR screenshot with this exact filename.",
+                            default_path, e
+                        );
+                        let error_wide: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, PCWSTR(error_wide.as_ptr()),
+                                   w!("QR Scan Failed"), MB_OK | MB_ICONERROR);
+                    }
+                }
+            }
+        }

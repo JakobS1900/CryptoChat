@@ -1,0 +1,18 @@
+[package]
+name = "cryptochat-crypto-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared OpenPGP utilities for CryptoChat clients"
+license = "MIT"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+rand_chacha.workspace = true
+sha2.workspace = true
+base64.workspace = true
+
+rand.workspace = true
+sequoia-openpgp = { version = "1.21", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto", "compression", "compression-deflate"] }

@@ -1,0 +1,140 @@
+# ===================
+# CryptoChat .gitignore
+# ===================
+
+# --------------------
+# Rust Build Artifacts
+# --------------------
+# Root target directory
+/target/
+# Nested target directories (windows-native client)
+**/target/
+# Backup files
+**/*.rs.bk
+# Cargo lock in sub-projects (keep root Cargo.lock)
+**/Cargo.lock
+!/Cargo.lock
+
+# --------------------
+# Android Build
+# --------------------
+.gradle/
+**/build/
+local.properties
+*.iml
+.cxx/
+*.keystore
+*.jks
+.kotlin/
+# Gradle wrapper/distributions (large JAR files)
+gradle-*/
+**/gradle-*/
+**/wrapper/dists/
+
+# --------------------
+# IDE & Editors
+# --------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/
+.helix/
+
+# --------------------
+# OS Generated
+# --------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --------------------
+# Node.js (if any)
+# --------------------
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --------------------
+# Environment & Secrets
+# --------------------
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.crt
+!*.example.key
+credentials.*
+secrets.*
+config.local.*
+
+# --------------------
+# Specs & Test Files (local only)
+# --------------------
+specs/
+tests/
+test_*.rs
+
+# --------------------
+# Agent/AI Tools
+# --------------------
+.specify/
+.claude/
+.codex/
+.speckit/
+.speckit-cache/
+.agent/
+
+# --------------------
+# Testing & Coverage
+# --------------------
+*.profraw
+*.profdata
+coverage/
+*.lcov
+htmlcov/
+
+# --------------------
+# Logs
+# --------------------
+*.log
+logs/
+
+# --------------------
+# Temporary Files  
+# --------------------
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# --------------------
+# Generated Files
+# --------------------
+cryptochat_qr.png
+*.qr.png
+
+# --------------------
+# Windows Native Client
+# --------------------
+clients/windows-native/target/
+clients/windows-native/*.exe
+
+# --------------------
+# Keep these files
+# --------------------
+!.gitkeep
+!README.md
+!AGENTS.md

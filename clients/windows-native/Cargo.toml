@@ -1,0 +1,50 @@
+[package]
+name = "cryptochat-windows"
+version = "0.1.0"
+edition = "2021"
+description = "CryptoChat Windows Native Client"
+license = "MIT"
+
+[[bin]]
+name = "cryptochat"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_Security_Credentials",
+    "Win32_UI_Controls_Dialogs",
+] }
+anyhow = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+base64 = "0.22"
+
+# CryptoChat dependencies
+cryptochat-crypto-core = { path = "../../shared/crypto-core" }
+cryptochat-messaging = { path = "../../shared/messaging" }
+cryptochat-node = { path = "../../node" }
+zeroize = "1.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+qrcode = "0.14"
+image = "0.25"
+rqrr = "0.7"
+uuid = { version = "1.7", features = ["v4", "serde"] }
+
+[build-dependencies]
+embed-resource = "2.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+[workspace]

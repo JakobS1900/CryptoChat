@@ -1,0 +1,17 @@
+[package]
+name = "cryptochat-messaging"
+version = "0.1.0"
+edition = "2021"
+description = "Messaging protocol models and helpers for CryptoChat"
+license = "MIT"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+cryptochat-crypto-core = { path = "../crypto-core" }
+sequoia-openpgp = { version = "1.22", default-features = false }
+base64 = "0.22"

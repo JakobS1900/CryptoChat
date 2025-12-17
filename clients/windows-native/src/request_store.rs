@@ -33,7 +33,7 @@ fn get_data_dir() -> Result<PathBuf> {
         .or_else(|_| std::env::var("HOME"))
         .context("Could not find home directory")?;
 
-    // Include instance suffix in directory name for multi-instance testing
+    // Include instance suffix for multi-instance testing
     let dir_name = match crate::get_instance_id() {
         Some(id) => format!(".cryptochat_{}", id),
         None => ".cryptochat".to_string(),

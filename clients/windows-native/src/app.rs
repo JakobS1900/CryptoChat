@@ -4,7 +4,6 @@ use base64::Engine;
 use cryptochat_crypto_core::pgp::PgpKeyPair;
 use cryptochat_messaging::{DeviceId, onboarding::TrustRecord};
 use std::collections::HashMap;
-use crate::network::NetworkHandle;
 use std::sync::{Arc, RwLock};
 
 pub struct AppState {
@@ -12,15 +11,7 @@ pub struct AppState {
     pub recipient_keypair: Arc<RwLock<Option<PgpKeyPair>>>,
     pub device_id: DeviceId,
     pub trust_records: Arc<RwLock<HashMap<String, TrustRecord>>>,
-    pub current_view: Arc<RwLock<AppView>>,
-    pub network: Arc<RwLock<Option<NetworkHandle>>>,
     pub peer_address: Arc<RwLock<Option<String>>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum AppView {
-    Onboarding,
-    Chat,
 }
 
 impl AppState {
@@ -30,8 +21,6 @@ impl AppState {
             recipient_keypair: Arc::new(RwLock::new(None)),
             device_id: DeviceId::new(),
             trust_records: Arc::new(RwLock::new(HashMap::new())),
-            current_view: Arc::new(RwLock::new(AppView::Onboarding)),
-            network: Arc::new(RwLock::new(None)),
             peer_address: Arc::new(RwLock::new(None)),
         }
     }
@@ -59,7 +48,6 @@ impl AppState {
         match (my_keypair.as_ref(), recipient_keypair.as_ref()) {
             (Some(my_key), Some(recipient_key)) => {
                 let encrypted_bytes = my_key.encrypt_and_sign(recipient_key.cert(), plaintext.as_bytes())?;
-                // Convert to base64 for text display
                 Ok(base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes))
             }
             _ => anyhow::bail!("Keys not initialized"),
@@ -80,32 +68,8 @@ impl AppState {
         }
     }
 
-    pub fn switch_to_chat(&self) {
-        *self.current_view.write().unwrap() = AppView::Chat;
-    }
-
-    pub fn start_network(&self, hwnd: windows::Win32::Foundation::HWND) -> anyhow::Result<u16> {
-        let handle = NetworkHandle::start(hwnd)?;
-        let port = handle.port();
-        *self.network.write().unwrap() = Some(handle);
-        Ok(port)
-    }
-
     pub fn set_peer_address(&self, address: String) {
         *self.peer_address.write().unwrap() = Some(address);
-    }
-
-    pub fn send_encrypted_message(&self, encrypted_base64: String) -> anyhow::Result<()> {
-        let peer_address = self.peer_address.read().unwrap();
-        match peer_address.as_ref() {
-            Some(addr) => {
-                let envelope = crate::network::MessageEnvelope::RegularMessage {
-                    encrypted_payload: encrypted_base64,
-                };
-                NetworkHandle::send_message(addr, envelope)
-            },
-            None => anyhow::bail!("Peer address not set"),
-        }
     }
 }
 
@@ -114,3 +78,4 @@ impl Default for AppState {
         Self::new()
     }
 }
+

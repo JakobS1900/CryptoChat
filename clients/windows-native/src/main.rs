@@ -67,6 +67,8 @@ pub struct CryptoChat {
     show_emoji_picker: bool,
     /// Emoji suggestions for :emoji: autocomplete
     emoji_suggestions: Vec<(&'static str, &'static str)>,
+    /// Dark mode enabled (false = light mode)
+    dark_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +121,8 @@ pub enum Message {
     RemoveContact(usize),
     /// Save image from inline preview to disk (index in chat_messages)
     SaveImage(usize),
+    /// Toggle between light and dark mode
+    ToggleTheme,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +185,7 @@ impl Application for CryptoChat {
                 peer_last_read: None,
                 show_emoji_picker: false,
                 emoji_suggestions: Vec::new(),
+                dark_mode: true,  // Default to dark mode
             },
             init_command,
         )
@@ -728,6 +733,10 @@ impl Application for CryptoChat {
                 }
                 Command::none()
             }
+            Message::ToggleTheme => {
+                self.dark_mode = !self.dark_mode;
+                Command::none()
+            }
         }
     }
 
@@ -744,7 +753,11 @@ impl Application for CryptoChat {
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        if self.dark_mode {
+            Theme::Dark
+        } else {
+            Theme::Light
+        }
     }
 }
 
@@ -1054,6 +1067,8 @@ impl CryptoChat {
         };
         
         let clear_btn = button(text("Clear History").size(10)).padding([4, 8]).on_press(Message::ClearHistory);
+        let theme_label = if self.dark_mode { "Light Mode" } else { "Dark Mode" };
+        let theme_btn = button(text(theme_label).size(10)).padding([4, 8]).on_press(Message::ToggleTheme);
         
         // Build contacts list with delete buttons
         let contacts_section: Element<Message> = if self.contacts.is_empty() {
@@ -1090,7 +1105,7 @@ impl CryptoChat {
                 text("Contacts:").size(10),
                 contacts_section,
                 Space::with_height(Length::Fill),
-                clear_btn,
+                row![theme_btn, clear_btn].spacing(4),
             ].padding(10).spacing(2)
         ).width(260).height(Length::Fill);
         

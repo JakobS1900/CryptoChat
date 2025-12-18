@@ -872,10 +872,28 @@ impl CryptoChat {
             msg.sender_name.clone()
         };
         
+        // Add read receipt indicators for sent messages
+        let status_indicator = if msg.is_mine {
+            // Compare timestamps to determine if message was read
+            let is_read = self.peer_last_read.as_ref()
+                .map(|lr| lr >= &msg.timestamp)
+                .unwrap_or(false);
+            if is_read {
+                " ✓✓" // Double check = read
+            } else {
+                " ✓"  // Single check = sent
+            }
+        } else {
+            ""
+        };
+        
         let bubble_content = column![
             text(&name_label).size(11),
             text(&msg.content).size(14),
-            text(&msg.timestamp).size(9),
+            row![
+                text(&msg.timestamp).size(9),
+                text(status_indicator).size(9),
+            ].spacing(4),
         ].spacing(3);
         
         let bubble_style: fn(&Theme) -> container::Appearance = if msg.is_mine {

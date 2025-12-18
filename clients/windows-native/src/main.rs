@@ -8,12 +8,15 @@ mod request_store;
 mod theme;
 
 use iced::widget::{button, column, container, row, text, text_input, scrollable, Space};
-use iced::{Application, Command, Element, Length, Settings, Subscription, Theme, Background, Border, Color};
+use iced::{Application, Command, Element, Font, Length, Settings, Subscription, Theme, Background, Border, Color};
 use std::sync::{Arc, OnceLock, Mutex};
 use tokio::sync::mpsc;
 
 static INSTANCE_ID: OnceLock<Option<u32>> = OnceLock::new();
 static NETWORK_RECEIVER: OnceLock<Mutex<Option<mpsc::UnboundedReceiver<network::NetworkEvent>>>> = OnceLock::new();
+
+/// Font for emoji rendering (Segoe UI Emoji loaded in Settings)
+const EMOJI_FONT: Font = Font::with_name("Segoe UI Emoji");
 
 /// Emoji list for :emoji: autocomplete (name, emoji)
 const EMOJI_LIST: &[(&str, &str)] = &[
@@ -1146,12 +1149,12 @@ impl CryptoChat {
             column![message_row].padding(12)
         };
         
-        // Emoji picker panel - now with Segoe UI Emoji font loaded
+        // Emoji picker panel - using EMOJI_FONT for rendering
         let emoji_picker: Element<Message> = if self.show_emoji_picker {
             let emojis = ["😀", "😂", "😢", "😎", "🤔", "❤️", "👍", "👎", 
                           "🔥", "⭐", "🎉", "👋", "✅", "❌", "💯", "🙏"];
             let emoji_buttons: Vec<Element<Message>> = emojis.iter().map(|e| {
-                button(text(*e).size(20))
+                button(text(*e).size(20).font(EMOJI_FONT))
                     .padding([6, 10])
                     .on_press(Message::InsertEmoji(e.to_string()))
                     .into()
@@ -1168,7 +1171,7 @@ impl CryptoChat {
             let suggestion_items: Vec<Element<Message>> = self.emoji_suggestions.iter().map(|(name, emoji)| {
                 button(
                     row![
-                        text(*emoji).size(16),
+                        text(*emoji).size(16).font(EMOJI_FONT),
                         text(format!(":{name}:")).size(12),
                     ].spacing(8)
                 )
@@ -1243,10 +1246,10 @@ impl CryptoChat {
                 ].spacing(4),
             ].spacing(3).into()
         } else {
-            // Regular text message
+            // Regular text message - use EMOJI_FONT for emoji support
             column![
                 text(&name_label).size(11),
-                text(&msg.content).size(14),
+                text(&msg.content).size(14).font(EMOJI_FONT),
                 row![
                     text(&msg.timestamp).size(9),
                     text(status_indicator).size(9),

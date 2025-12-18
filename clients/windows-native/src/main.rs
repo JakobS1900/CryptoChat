@@ -15,15 +15,14 @@ use tokio::sync::mpsc;
 static INSTANCE_ID: OnceLock<Option<u32>> = OnceLock::new();
 static NETWORK_RECEIVER: OnceLock<Mutex<Option<mpsc::UnboundedReceiver<network::NetworkEvent>>>> = OnceLock::new();
 
-/// Emoji list for :emoji: autocomplete (name, emoticon)
+/// Emoji list for :emoji: autocomplete (name, emoji)
 const EMOJI_LIST: &[(&str, &str)] = &[
-    ("smile", ":)"), ("grin", ":D"), ("joy", "XD"), ("wink", ";)"),
-    ("tongue", ":P"), ("shocked", ":O"), ("skeptical", ":/"), ("neutral", ":|"),
-    ("heart", "<3"), ("kiss", ":*"), ("cry", ":'("), ("angry", ">:("),
-    ("cool", "B)"), ("cat", ":3"), ("angel", "O:)"), ("cheer", "\\o/"),
-    ("thumbsup", ":thumbsup:"), ("thumbsdown", ":thumbsdown:"),
-    ("fire", ":fire:"), ("star", ":star:"), ("check", ":check:"), ("x", ":x:"),
-    ("party", ":party:"), ("100", ":100:"), ("eyes", ":eyes:"), ("think", ":think:"),
+    ("smile", "😀"), ("grin", "😁"), ("joy", "😂"), ("wink", "😉"),
+    ("heart_eyes", "😍"), ("kiss", "😘"), ("thinking", "🤔"), ("neutral", "😐"),
+    ("sad", "😢"), ("cry", "😭"), ("angry", "😠"), ("cool", "😎"),
+    ("thumbsup", "👍"), ("thumbsdown", "👎"), ("clap", "👏"), ("wave", "👋"),
+    ("fire", "🔥"), ("heart", "❤️"), ("star", "⭐"), ("party", "🎉"),
+    ("check", "✅"), ("x", "❌"), ("100", "💯"), ("pray", "🙏"),
 ];
 
 pub fn get_instance_id() -> Option<u32> {
@@ -1147,18 +1146,14 @@ impl CryptoChat {
             column![message_row].padding(12)
         };
         
-        // Emoji picker panel - using named labels that map to emoticons
+        // Emoji picker panel - now with Segoe UI Emoji font loaded
         let emoji_picker: Element<Message> = if self.show_emoji_picker {
-            // Label -> actual emoticon to insert
-            let emojis: &[(&str, &str)] = &[
-                ("smile", ":)"), ("sad", ":("), ("grin", ":D"), ("wink", ";)"),
-                ("tongue", ":P"), ("laugh", "XD"), ("heart", "<3"), ("cool", "B)"),
-                ("think", ":/"), ("meh", ":|"), ("cry", ":'("), ("angry", ">:("),
-            ];
-            let emoji_buttons: Vec<Element<Message>> = emojis.iter().map(|(label, emoticon)| {
-                button(text(*label))
+            let emojis = ["😀", "😂", "😢", "😎", "🤔", "❤️", "👍", "👎", 
+                          "🔥", "⭐", "🎉", "👋", "✅", "❌", "💯", "🙏"];
+            let emoji_buttons: Vec<Element<Message>> = emojis.iter().map(|e| {
+                button(text(*e).size(20))
                     .padding([6, 10])
-                    .on_press(Message::InsertEmoji(emoticon.to_string()))
+                    .on_press(Message::InsertEmoji(e.to_string()))
                     .into()
             }).collect();
             container(
@@ -1300,12 +1295,16 @@ fn main() -> iced::Result {
     }
     INSTANCE_ID.set(instance_id).ok();
     
+    // Load Segoe UI Emoji font for emoji support
+    let emoji_font_bytes: &'static [u8] = include_bytes!("C:/Windows/Fonts/seguiemj.ttf");
+    
     CryptoChat::run(Settings {
         window: iced::window::Settings {
             size: iced::Size::new(900.0, 650.0),
             min_size: Some(iced::Size::new(700.0, 450.0)),
             ..Default::default()
         },
+        fonts: vec![std::borrow::Cow::Borrowed(emoji_font_bytes)],
         ..Default::default()
     })
 }

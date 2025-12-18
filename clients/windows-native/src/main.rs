@@ -15,20 +15,15 @@ use tokio::sync::mpsc;
 static INSTANCE_ID: OnceLock<Option<u32>> = OnceLock::new();
 static NETWORK_RECEIVER: OnceLock<Mutex<Option<mpsc::UnboundedReceiver<network::NetworkEvent>>>> = OnceLock::new();
 
-/// Emoji list for :emoji: autocomplete (name, emoji)
+/// Emoji list for :emoji: autocomplete (name, emoticon)
 const EMOJI_LIST: &[(&str, &str)] = &[
-    ("smile", "😀"), ("grin", "😁"), ("joy", "😂"), ("rofl", "🤣"),
-    ("blush", "😊"), ("heart_eyes", "😍"), ("kiss", "😘"), ("wink", "😉"),
-    ("thinking", "🤔"), ("neutral", "😐"), ("expressionless", "😑"), ("unamused", "😒"),
-    ("sweat", "😓"), ("sad", "😢"), ("cry", "😭"), ("angry", "😠"),
-    ("rage", "😡"), ("cool", "😎"), ("nerd", "🤓"), ("sunglasses", "🕶️"),
-    ("thumbsup", "👍"), ("thumbsdown", "👎"), ("clap", "👏"), ("wave", "👋"),
-    ("pray", "🙏"), ("muscle", "💪"), ("fire", "🔥"), ("heart", "❤️"),
-    ("star", "⭐"), ("sparkles", "✨"), ("party", "🎉"), ("100", "💯"),
-    ("check", "✅"), ("x", "❌"), ("warning", "⚠️"), ("question", "❓"),
-    ("exclamation", "❗"), ("zzz", "💤"), ("eyes", "👀"), ("brain", "🧠"),
-    ("rocket", "🚀"), ("money", "💰"), ("gem", "💎"), ("crown", "👑"),
-    ("skull", "💀"), ("ghost", "👻"), ("alien", "👽"), ("robot", "🤖"),
+    ("smile", ":)"), ("grin", ":D"), ("joy", "XD"), ("wink", ";)"),
+    ("tongue", ":P"), ("shocked", ":O"), ("skeptical", ":/"), ("neutral", ":|"),
+    ("heart", "<3"), ("kiss", ":*"), ("cry", ":'("), ("angry", ">:("),
+    ("cool", "B)"), ("cat", ":3"), ("angel", "O:)"), ("cheer", "\\o/"),
+    ("thumbsup", ":thumbsup:"), ("thumbsdown", ":thumbsdown:"),
+    ("fire", ":fire:"), ("star", ":star:"), ("check", ":check:"), ("x", ":x:"),
+    ("party", ":party:"), ("100", ":100:"), ("eyes", ":eyes:"), ("think", ":think:"),
 ];
 
 pub fn get_instance_id() -> Option<u32> {
@@ -84,6 +79,10 @@ pub struct ChatMessage {
     pub content: String,
     pub is_mine: bool,
     pub timestamp: String,
+    /// Optional image data for inline preview (stored in memory)
+    pub image_data: Option<Vec<u8>>,
+    /// Filename for images (used for save button)
+    pub image_filename: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,13 +107,16 @@ pub enum Message {
     ClearHistory,
     SelectContact(usize),
     PickFile,
-    FileSent(Result<(), String>),
+    /// Result contains (filename, raw_file_data) for successful sends
+    FileSent(Result<(String, Vec<u8>), String>),
     ToggleEmojiPicker,
     InsertEmoji(String),
     /// Select emoji from :emoji: autocomplete (name, emoji)
     SelectEmojiSuggestion(String, String),
     /// Remove a contact (synced to peer)
     RemoveContact(usize),
+    /// Save image from inline preview to disk (index in chat_messages)
+    SaveImage(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +359,8 @@ impl Application for CryptoChat {
                     content: content.clone(),
                     is_mine: true,
                     timestamp: chrono_time(),
+                    image_data: None,
+                    image_filename: None,
                 };
                 save_message_to_history(&new_msg);
                 self.chat_messages.push(new_msg);
@@ -387,6 +391,8 @@ impl Application for CryptoChat {
                                     content: plaintext.clone(),
                                     is_mine: false,
                                     timestamp: chrono_time(),
+                                    image_data: None,
+                                    image_filename: None,
                                 };
                                 save_message_to_history(&new_msg);
                                 self.chat_messages.push(new_msg);
@@ -436,26 +442,34 @@ impl Application for CryptoChat {
                             if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_secret_key(&stored_key.secret_key_armored) {
                                 if let Ok(data_bytes) = base64::engine::general_purpose::STANDARD.decode(&encrypted_data) {
                                     if let Ok(decrypted) = keypair.decrypt(&data_bytes) {
-                                        // Save to downloads folder
-                                        let downloads_dir = format!("{}\\Downloads", std::env::var("USERPROFILE").unwrap_or_default());
-                                        let save_path = format!("{}\\{}", downloads_dir, filename);
-                                        if let Err(e) = std::fs::write(&save_path, &decrypted) {
-                                            self.status = format!("Save failed: {}", e);
-                                        } else {
-                                            let name = sender_name.unwrap_or_else(|| self.peer_username.clone().unwrap_or_else(|| "Peer".to_string()));
-                                            let new_msg = ChatMessage {
-                                                sender_name: name.clone(),
-                                                content: format!("📎 File: {} (saved to Downloads)", filename),
-                                                is_mine: false,
-                                                timestamp: chrono_time(),
-                                            };
+                                        let name = sender_name.unwrap_or_else(|| self.peer_username.clone().unwrap_or_else(|| "Peer".to_string()));
+                                        
+                                        // Check if this is an image file
+                                        let is_image = filename.to_lowercase().ends_with(".png") 
+                                            || filename.to_lowercase().ends_with(".jpg")
+                                            || filename.to_lowercase().ends_with(".jpeg")
+                                            || filename.to_lowercase().ends_with(".gif")
+                                            || filename.to_lowercase().ends_with(".bmp");
+                                        
+                                        let new_msg = ChatMessage {
+                                            sender_name: name.clone(),
+                                            content: if is_image { format!("[Image: {}]", filename) } else { format!("[File: {}]", filename) },
+                                            is_mine: false,
+                                            timestamp: chrono_time(),
+                                            image_data: if is_image { Some(decrypted.clone()) } else { None },
+                                            image_filename: Some(filename.clone()),
+                                        };
+                                        
+                                        // Don't save to history if it's an image (too large)
+                                        if !is_image {
                                             save_message_to_history(&new_msg);
-                                            self.chat_messages.push(new_msg);
-                                            show_notification(&format!("File from {}", name), &format!("Received: {}", filename));
-                                            play_notification_sound();
-                                            self.unread_count += 1;
-                                            self.peer_is_typing = false;
                                         }
+                                        self.chat_messages.push(new_msg);
+                                        show_notification(&format!("File from {}", name), &format!("Received: {}", filename));
+                                        play_notification_sound();
+                                        self.unread_count += 1;
+                                        self.peer_is_typing = false;
+                                        self.status = format!("Received: {}", filename);
                                     }
                                 }
                             }
@@ -627,8 +641,27 @@ impl Application for CryptoChat {
             }
             Message::FileSent(result) => {
                 match result {
-                    Ok(()) => self.status = "File sent!".to_string(),
-                    Err(e) => self.status = format!("File send failed: {}", e),
+                    Ok((filename, file_data)) => {
+                        self.status = format!("Sent: {}", filename);
+                        
+                        // Check if this is an image and add to sender's chat
+                        let is_image = filename.to_lowercase().ends_with(".png") 
+                            || filename.to_lowercase().ends_with(".jpg")
+                            || filename.to_lowercase().ends_with(".jpeg")
+                            || filename.to_lowercase().ends_with(".gif")
+                            || filename.to_lowercase().ends_with(".bmp");
+                        
+                        let new_msg = ChatMessage {
+                            sender_name: self.my_username.clone(),
+                            content: if is_image { format!("[Image: {}]", filename) } else { format!("[File: {}]", filename) },
+                            is_mine: true,
+                            timestamp: chrono_time(),
+                            image_data: if is_image { Some(file_data) } else { None },
+                            image_filename: Some(filename),
+                        };
+                        self.chat_messages.push(new_msg);
+                    }
+                    Err(e) => self.status = format!("Send failed: {}", e),
                 }
                 Command::none()
             }
@@ -671,6 +704,24 @@ impl Application for CryptoChat {
                         self.recipient_key_imported = false;
                         self.peer_address = None;
                         self.peer_username = None;
+                    }
+                }
+                Command::none()
+            }
+            Message::SaveImage(index) => {
+                // Save image from inline preview to disk
+                if let Some(msg) = self.chat_messages.get(index) {
+                    if let (Some(data), Some(filename)) = (&msg.image_data, &msg.image_filename) {
+                        let downloads_dir = format!("{}\\Downloads", std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Public".to_string()));
+                        let _ = std::fs::create_dir_all(&downloads_dir);
+                        let save_path = format!("{}\\{}", downloads_dir, filename);
+                        match std::fs::write(&save_path, data) {
+                            Ok(_) => {
+                                self.status = format!("SAVED: {}", filename);
+                                show_notification("Image Saved!", &format!("Saved to: {}", save_path));
+                            }
+                            Err(e) => self.status = format!("Save failed: {}", e),
+                        }
                     }
                 }
                 Command::none()
@@ -730,7 +781,7 @@ fn pick_and_send_file(
     app_state: Arc<app::AppState>,
     peer_addr: Option<String>,
     sender_name: String,
-) -> Result<(), String> {
+) -> Result<(String, Vec<u8>), String> {
     let peer_addr = peer_addr.ok_or("No peer connected")?;
     
     // Use PowerShell to open file picker
@@ -773,13 +824,16 @@ if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName } else { '' }
     
     // Send file message
     let envelope = network::MessageEnvelope::FileMessage {
-        filename,
+        filename: filename.clone(),
         encrypted_data: encoded,
         sender_name: Some(sender_name),
     };
     
     network::NetworkHandle::send_message(&peer_addr, envelope)
-        .map_err(|e| format!("Send failed: {}", e))
+        .map_err(|e| format!("Send failed: {}", e))?;
+    
+    // Return filename and raw data for sender's display
+    Ok((filename, file_data))
 }
 
 /// Show Windows toast notification
@@ -893,6 +947,8 @@ fn load_chat_history_sync() -> Vec<ChatMessage> {
             content: m.content,
             is_mine: m.is_mine,
             timestamp: m.timestamp,
+            image_data: None,  // Images not stored in history
+            image_filename: None,
         })
         .collect()
 }
@@ -1028,11 +1084,6 @@ impl CryptoChat {
                 row![qr_btn].spacing(4),
                 Space::with_height(12),
                 import_section,
-                Space::with_height(8),
-                row![
-                    button(text("FILE")).padding([4, 8]).on_press(Message::PickFile),
-                    button(text("EMOJI")).padding([4, 8]).on_press(Message::ToggleEmojiPicker),
-                ].spacing(4),
                 Space::with_height(12),
                 text("Contacts:").size(10),
                 contacts_section,
@@ -1053,8 +1104,8 @@ impl CryptoChat {
                 ].spacing(4).align_items(iced::Alignment::Center)
             ).width(Length::Fill).height(Length::Fill).center_x().center_y().into()
         } else {
-            let bubbles: Vec<Element<Message>> = self.chat_messages.iter().map(|msg| {
-                self.render_bubble(msg)
+            let bubbles: Vec<Element<Message>> = self.chat_messages.iter().enumerate().map(|(idx, msg)| {
+                self.render_bubble(msg, idx)
             }).collect();
             scrollable(column(bubbles).spacing(8).padding(16)).width(Length::Fill).height(Length::Fill).into()
         };
@@ -1096,14 +1147,18 @@ impl CryptoChat {
             column![message_row].padding(12)
         };
         
-        // Emoji picker panel
+        // Emoji picker panel - using named labels that map to emoticons
         let emoji_picker: Element<Message> = if self.show_emoji_picker {
-            let emojis = ["😀", "😂", "🥰", "😎", "🤔", "😢", "😡", "👍", "👎", "❤️", 
-                          "🔥", "⭐", "🎉", "👋", "🙏", "💪", "🤝", "✅", "❌", "💯"];
-            let emoji_buttons: Vec<Element<Message>> = emojis.iter().map(|e| {
-                button(text(*e).size(20))
-                    .padding([4, 8])
-                    .on_press(Message::InsertEmoji(e.to_string()))
+            // Label -> actual emoticon to insert
+            let emojis: &[(&str, &str)] = &[
+                ("smile", ":)"), ("sad", ":("), ("grin", ":D"), ("wink", ";)"),
+                ("tongue", ":P"), ("laugh", "XD"), ("heart", "<3"), ("cool", "B)"),
+                ("think", ":/"), ("meh", ":|"), ("cry", ":'("), ("angry", ">:("),
+            ];
+            let emoji_buttons: Vec<Element<Message>> = emojis.iter().map(|(label, emoticon)| {
+                button(text(*label))
+                    .padding([6, 10])
+                    .on_press(Message::InsertEmoji(emoticon.to_string()))
                     .into()
             }).collect();
             container(
@@ -1133,19 +1188,12 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
-        // Build chat header with action buttons when connected
-        let header_content = if self.recipient_key_imported {
-            row![
-                text("Chat").size(18),
-                Space::with_width(8),
-                button(text("File")).padding([4, 8]).on_press(Message::PickFile),
-                button(text("Emoji")).padding([4, 8]).on_press(Message::ToggleEmojiPicker),
-                Space::with_width(Length::Fill),
-                text(&self.status).size(10)
-            ].spacing(8).padding(10)
-        } else {
-            row![text("Chat").size(18), Space::with_width(Length::Fill), text(&self.status).size(10)].padding(10)
-        };
+        // Simple chat header with status
+        let header_content = row![
+            text("Chat").size(18), 
+            Space::with_width(Length::Fill), 
+            text(&self.status).size(10)
+        ].padding(10);
         
         let chat_area = column![
             container(header_content),
@@ -1159,7 +1207,7 @@ impl CryptoChat {
         row![sidebar, chat_area].width(Length::Fill).height(Length::Fill).into()
     }
     
-    fn render_bubble(&self, msg: &ChatMessage) -> Element<Message> {
+    fn render_bubble(&self, msg: &ChatMessage, msg_index: usize) -> Element<Message> {
         let name_label = if msg.is_mine {
             format!("{} (You)", msg.sender_name)
         } else {
@@ -1173,22 +1221,43 @@ impl CryptoChat {
                 .map(|lr| lr >= &msg.timestamp)
                 .unwrap_or(false);
             if is_read {
-                " ✓✓" // Double check = read
+                " [read]" // Double check = read
             } else {
-                " ✓"  // Single check = sent
+                " [sent]"  // Single check = sent
             }
         } else {
             ""
         };
         
-        let bubble_content = column![
-            text(&name_label).size(11),
-            text(&msg.content).size(14),
-            row![
-                text(&msg.timestamp).size(9),
-                text(status_indicator).size(9),
-            ].spacing(4),
-        ].spacing(3);
+        // Build content based on whether this is an image message
+        let bubble_content: Element<Message> = if let Some(ref image_bytes) = msg.image_data {
+            // Render inline image with Save button
+            let img_handle = iced::widget::image::Handle::from_memory(image_bytes.clone());
+            let img_widget = iced::widget::Image::new(img_handle)
+                .width(Length::Fixed(200.0))
+                .height(Length::Shrink);
+            
+            column![
+                text(&name_label).size(11),
+                img_widget,
+                row![
+                    button(text("Save")).padding([4, 8]).on_press(Message::SaveImage(msg_index)),
+                    Space::with_width(8),
+                    text(&msg.timestamp).size(9),
+                    text(status_indicator).size(9),
+                ].spacing(4),
+            ].spacing(3).into()
+        } else {
+            // Regular text message
+            column![
+                text(&name_label).size(11),
+                text(&msg.content).size(14),
+                row![
+                    text(&msg.timestamp).size(9),
+                    text(status_indicator).size(9),
+                ].spacing(4),
+            ].spacing(3).into()
+        };
         
         let bubble_style: fn(&Theme) -> container::Appearance = if msg.is_mine {
             |_| theme::my_bubble()

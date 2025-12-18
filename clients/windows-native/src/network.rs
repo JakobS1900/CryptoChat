@@ -34,6 +34,9 @@ pub enum NetworkEvent {
         encrypted_data: String,
         sender_name: Option<String>,
     },
+    ContactRemovalReceived {
+        fingerprint: String,
+    },
     Error(String),
 }
 
@@ -72,6 +75,11 @@ pub enum MessageEnvelope {
         /// Base64-encoded encrypted file data
         encrypted_data: String,
         sender_name: Option<String>,
+    },
+    /// Contact removal notification
+    ContactRemoved {
+        /// Fingerprint of the contact being removed
+        fingerprint: String,
     },
 }
 
@@ -175,6 +183,9 @@ fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<Netw
         }
         MessageEnvelope::FileMessage { filename, encrypted_data, sender_name } => {
             let _ = sender.send(NetworkEvent::FileReceived { filename, encrypted_data, sender_name });
+        }
+        MessageEnvelope::ContactRemoved { fingerprint } => {
+            let _ = sender.send(NetworkEvent::ContactRemovalReceived { fingerprint });
         }
     }
     Ok(())

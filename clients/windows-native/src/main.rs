@@ -113,6 +113,8 @@ pub enum Message {
     InsertEmoji(String),
     /// Select emoji from :emoji: autocomplete (name, emoji)
     SelectEmojiSuggestion(String, String),
+    /// Remove a contact (synced to peer)
+    RemoveContact(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -430,30 +432,47 @@ impl Application for CryptoChat {
                     network::NetworkEvent::FileReceived { filename, encrypted_data, sender_name } => {
                         // Decrypt and save file
                         use base64::Engine;
-                        if let Ok(Some(my_key)) = keystore::load_keypair() {
-                            if let Ok(data_bytes) = base64::engine::general_purpose::STANDARD.decode(&encrypted_data) {
-                                if let Ok(decrypted) = my_key.decrypt(&data_bytes) {
-                                    // Save to downloads folder
-                                    let downloads_dir = format!("{}\\Downloads", std::env::var("USERPROFILE").unwrap_or_default());
-                                    let save_path = format!("{}\\{}", downloads_dir, filename);
-                                    if let Err(e) = std::fs::write(&save_path, &decrypted) {
-                                        self.status = format!("Save failed: {}", e);
-                                    } else {
-                                        let name = sender_name.unwrap_or_else(|| self.peer_username.clone().unwrap_or_else(|| "Peer".to_string()));
-                                        let new_msg = ChatMessage {
-                                            sender_name: name.clone(),
-                                            content: format!("📎 File: {} (saved to Downloads)", filename),
-                                            is_mine: false,
-                                            timestamp: chrono_time(),
-                                        };
-                                        save_message_to_history(&new_msg);
-                                        self.chat_messages.push(new_msg);
-                                        show_notification(&format!("File from {}", name), &format!("Received: {}", filename));
-                                        play_notification_sound();
-                                        self.unread_count += 1;
-                                        self.peer_is_typing = false;
+                        if let Ok(Some(stored_key)) = keystore::load_keypair() {
+                            if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_secret_key(&stored_key.secret_key_armored) {
+                                if let Ok(data_bytes) = base64::engine::general_purpose::STANDARD.decode(&encrypted_data) {
+                                    if let Ok(decrypted) = keypair.decrypt(&data_bytes) {
+                                        // Save to downloads folder
+                                        let downloads_dir = format!("{}\\Downloads", std::env::var("USERPROFILE").unwrap_or_default());
+                                        let save_path = format!("{}\\{}", downloads_dir, filename);
+                                        if let Err(e) = std::fs::write(&save_path, &decrypted) {
+                                            self.status = format!("Save failed: {}", e);
+                                        } else {
+                                            let name = sender_name.unwrap_or_else(|| self.peer_username.clone().unwrap_or_else(|| "Peer".to_string()));
+                                            let new_msg = ChatMessage {
+                                                sender_name: name.clone(),
+                                                content: format!("📎 File: {} (saved to Downloads)", filename),
+                                                is_mine: false,
+                                                timestamp: chrono_time(),
+                                            };
+                                            save_message_to_history(&new_msg);
+                                            self.chat_messages.push(new_msg);
+                                            show_notification(&format!("File from {}", name), &format!("Received: {}", filename));
+                                            play_notification_sound();
+                                            self.unread_count += 1;
+                                            self.peer_is_typing = false;
+                                        }
                                     }
                                 }
+                            }
+                        }
+                    }
+                    network::NetworkEvent::ContactRemovalReceived { fingerprint } => {
+                        // Peer removed us as a contact, remove them too
+                        if let Some(idx) = self.contacts.iter().position(|c| c.fingerprint == fingerprint) {
+                            let contact = self.contacts.remove(idx);
+                            let _ = request_store::save_simple_contacts(&self.contacts);
+                            self.status = format!("{} removed you as contact", contact.name);
+                            
+                            // Disconnect if this was current peer
+                            if self.peer_address.as_ref() == Some(&contact.address) {
+                                self.recipient_key_imported = false;
+                                self.peer_address = None;
+                                self.peer_username = None;
                             }
                         }
                     }
@@ -552,6 +571,11 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::SelectContact(index) => {
+                // Guard: Don't allow if already connected
+                if self.recipient_key_imported {
+                    self.status = "Already connected. Disconnect first.".to_string();
+                    return Command::none();
+                }
                 if let Some(contact) = self.contacts.get(index) {
                     // Set up connection to this contact
                     if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&contact.public_key) {
@@ -624,6 +648,31 @@ impl Application for CryptoChat {
                     self.message_input.push_str(&emoji);
                 }
                 self.emoji_suggestions.clear();
+                Command::none()
+            }
+            Message::RemoveContact(index) => {
+                if let Some(contact) = self.contacts.get(index).cloned() {
+                    // Send removal notification to peer
+                    let envelope = network::MessageEnvelope::ContactRemoved {
+                        fingerprint: contact.fingerprint.clone(),
+                    };
+                    let peer_addr = contact.address.clone();
+                    let _ = std::thread::spawn(move || {
+                        let _ = network::NetworkHandle::send_message(&peer_addr, envelope);
+                    });
+                    
+                    // Remove locally
+                    self.contacts.remove(index);
+                    let _ = request_store::save_simple_contacts(&self.contacts);
+                    self.status = format!("Removed {} (synced)", contact.name);
+                    
+                    // If this was the current peer, disconnect
+                    if self.peer_address.as_ref() == Some(&contact.address) {
+                        self.recipient_key_imported = false;
+                        self.peer_address = None;
+                        self.peer_username = None;
+                    }
+                }
                 Command::none()
             }
         }
@@ -715,7 +764,7 @@ if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName } else { '' }
     // Encrypt with recipient's public key
     let recipient_key = app_state.recipient_keypair.read().unwrap();
     let recipient = recipient_key.as_ref().ok_or("No recipient key")?;
-    let encrypted = recipient.encrypt(&file_data)
+    let encrypted = cryptochat_crypto_core::pgp::PgpKeyPair::encrypt(recipient.cert(), &file_data)
         .map_err(|e| format!("Encrypt failed: {}", e))?;
     
     // Encode as base64
@@ -948,17 +997,21 @@ impl CryptoChat {
         
         let clear_btn = button(text("Clear History").size(10)).padding([4, 8]).on_press(Message::ClearHistory);
         
-        // Build contacts list
+        // Build contacts list with delete buttons
         let contacts_section: Element<Message> = if self.contacts.is_empty() {
             text("No saved contacts").size(9).into()
         } else {
-            let contact_buttons: Vec<Element<Message>> = self.contacts.iter().enumerate().map(|(i, c)| {
-                button(text(&c.name).size(10))
-                    .padding([4, 8])
-                    .on_press(Message::SelectContact(i))
-                    .into()
+            let contact_rows: Vec<Element<Message>> = self.contacts.iter().enumerate().map(|(i, c)| {
+                row![
+                    button(text(&c.name).size(10))
+                        .padding([4, 8])
+                        .on_press(Message::SelectContact(i)),
+                    button(text("X").size(9))
+                        .padding([4, 6])
+                        .on_press(Message::RemoveContact(i)),
+                ].spacing(4).into()
             }).collect();
-            column(contact_buttons).spacing(2).into()
+            column(contact_rows).spacing(2).into()
         };
         
         let sidebar = container(
@@ -975,6 +1028,11 @@ impl CryptoChat {
                 row![qr_btn].spacing(4),
                 Space::with_height(12),
                 import_section,
+                Space::with_height(8),
+                row![
+                    button(text("FILE")).padding([4, 8]).on_press(Message::PickFile),
+                    button(text("EMOJI")).padding([4, 8]).on_press(Message::ToggleEmojiPicker),
+                ].spacing(4),
                 Space::with_height(12),
                 text("Contacts:").size(10),
                 contacts_section,
@@ -1011,23 +1069,31 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
-        // Input
+        // Input area with action bar
         let can_send = self.recipient_key_imported;
-        let input_row = if can_send {
-            row![
-                button(text("File").size(12)).padding([10, 12]).on_press(Message::PickFile),
-                button(text("Emoji").size(12)).padding([10, 12]).on_press(Message::ToggleEmojiPicker),
+        let input_area = if can_send {
+            // Action bar with buttons
+            let action_bar = row![
+                button(text("[+] File")).padding([6, 10]).on_press(Message::PickFile),
+                button(text("[:] Emoji")).padding([6, 10]).on_press(Message::ToggleEmojiPicker),
+            ].spacing(8);
+            
+            // Message input row
+            let message_row = row![
                 text_input("Type a message...", &self.message_input)
                     .on_input(Message::MessageInputChanged)
                     .on_submit(Message::SendMessage)
                     .padding(10).size(14),
                 button(text("Send")).padding([10, 16]).on_press(Message::SendMessage),
-            ].spacing(8).padding(12)
+            ].spacing(8);
+            
+            column![action_bar, message_row].spacing(6).padding(12)
         } else {
-            row![
+            let message_row = row![
                 text_input("Connect first...", "").padding(10).size(14),
                 button(text("Send")).padding([10, 16]),
-            ].spacing(8).padding(12)
+            ].spacing(8);
+            column![message_row].padding(12)
         };
         
         // Emoji picker panel
@@ -1067,13 +1133,27 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
+        // Build chat header with action buttons when connected
+        let header_content = if self.recipient_key_imported {
+            row![
+                text("Chat").size(18),
+                Space::with_width(8),
+                button(text("File")).padding([4, 8]).on_press(Message::PickFile),
+                button(text("Emoji")).padding([4, 8]).on_press(Message::ToggleEmojiPicker),
+                Space::with_width(Length::Fill),
+                text(&self.status).size(10)
+            ].spacing(8).padding(10)
+        } else {
+            row![text("Chat").size(18), Space::with_width(Length::Fill), text(&self.status).size(10)].padding(10)
+        };
+        
         let chat_area = column![
-            container(row![text("Chat").size(18), Space::with_width(Length::Fill), text(&self.status).size(10)].padding(10)),
+            container(header_content),
             messages_view,
             typing_indicator,
             emoji_picker,
             emoji_suggestions_panel,
-            input_row,
+            input_area,
         ].width(Length::Fill).height(Length::Fill);
         
         row![sidebar, chat_area].width(Length::Fill).height(Length::Fill).into()

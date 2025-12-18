@@ -23,6 +23,12 @@ pub enum NetworkEvent {
         sender_address: String,
         sender_name: Option<String>,
     },
+    TypingUpdate {
+        is_typing: bool,
+    },
+    ReadReceiptReceived {
+        last_read_timestamp: String,
+    },
     Error(String),
 }
 
@@ -45,6 +51,15 @@ pub enum MessageEnvelope {
     RegularMessage {
         encrypted_payload: String,
         sender_name: Option<String>,
+    },
+    /// Typing indicator (true = started typing, false = stopped)
+    TypingIndicator {
+        is_typing: bool,
+    },
+    /// Read receipt for message acknowledgment  
+    ReadReceipt {
+        /// Timestamp of the last read message
+        last_read_timestamp: String,
     },
 }
 
@@ -139,6 +154,12 @@ fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<Netw
         }
         MessageEnvelope::RegularMessage { encrypted_payload, sender_name } => {
             let _ = sender.send(NetworkEvent::MessageReceived { encrypted_payload, sender_name });
+        }
+        MessageEnvelope::TypingIndicator { is_typing } => {
+            let _ = sender.send(NetworkEvent::TypingUpdate { is_typing });
+        }
+        MessageEnvelope::ReadReceipt { last_read_timestamp } => {
+            let _ = sender.send(NetworkEvent::ReadReceiptReceived { last_read_timestamp });
         }
     }
     Ok(())

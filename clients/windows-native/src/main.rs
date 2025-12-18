@@ -42,6 +42,14 @@ pub struct CryptoChat {
     status: String,
     generating_keys: bool,
     listening_port: Option<u16>,
+    /// Saved contacts
+    contacts: Vec<request_store::SimpleContact>,
+    /// Unread message count for visual notification
+    unread_count: usize,
+    /// Whether peer is currently typing
+    peer_is_typing: bool,
+    /// Last read timestamp from peer (for ✓✓)
+    peer_last_read: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +86,7 @@ pub enum Message {
     NetworkEvent(network::NetworkEvent),
     PollNetwork,
     ClearHistory,
+    SelectContact(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +143,10 @@ impl Application for CryptoChat {
                 status: if has_keys { "Set username, then share your key".to_string() } else { "Generate keys".to_string() },
                 generating_keys: false,
                 listening_port: None,
+                contacts: request_store::load_simple_contacts().unwrap_or_default(),
+                unread_count: 0,
+                peer_is_typing: false,
+                peer_last_read: None,
             },
             init_command,
         )
@@ -141,10 +154,15 @@ impl Application for CryptoChat {
 
     fn title(&self) -> String {
         let suffix = get_instance_suffix();
-        if let Some(port) = self.listening_port {
-            format!("CryptoChat{} - {} - Port {}", suffix, self.my_username, port)
+        let unread = if self.unread_count > 0 {
+            format!("({}) ", self.unread_count)
         } else {
-            format!("CryptoChat{}", suffix)
+            String::new()
+        };
+        if let Some(port) = self.listening_port {
+            format!("{}CryptoChat{} - {} - Port {}", unread, suffix, self.my_username, port)
+        } else {
+            format!("{}CryptoChat{}", unread, suffix)
         }
     }
 
@@ -226,8 +244,19 @@ impl Application for CryptoChat {
                         self.peer_username = res.username.clone();
                         self.app_state.set_peer_address(res.address.clone());
                         self.key_share_input.clear();
-                        let peer_name = res.username.as_deref().unwrap_or("Peer");
+                        let peer_name = res.username.clone().unwrap_or_else(|| "Peer".to_string());
                         self.status = format!("Connected to {}! Sending our key...", peer_name);
+                        
+                        // Save contact for future reconnection
+                        let contact = request_store::SimpleContact {
+                            name: peer_name.clone(),
+                            fingerprint: res.fingerprint.clone(),
+                            public_key: self.app_state.recipient_keypair.read().unwrap()
+                                .as_ref().map(|k| k.export_public_key().unwrap_or_default()).unwrap_or_default(),
+                            address: res.address.clone(),
+                        };
+                        let _ = request_store::upsert_simple_contact(&contact);
+                        self.contacts = request_store::load_simple_contacts().unwrap_or_default();
                         
                         // Send OUR public key to the peer so they can encrypt messages to us
                         if let (Ok(Some(our_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
@@ -243,13 +272,7 @@ impl Application for CryptoChat {
                                     network::NetworkHandle::send_message(&peer_addr, envelope)
                                         .map_err(|e| e.to_string())
                                 },
-                                |result| {
-                                    if result.is_ok() {
-                                        Message::MessageSent(Ok(()))
-                                    } else {
-                                        Message::MessageSent(result)
-                                    }
-                                },
+                                |result| Message::MessageSent(result),
                             );
                         }
                     }
@@ -258,13 +281,30 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::MessageInputChanged(value) => {
-                self.message_input = value;
+                let was_empty = self.message_input.is_empty();
+                self.message_input = value.clone();
+                let is_empty = self.message_input.is_empty();
+                
+                // Send typing indicator when user starts/stops typing
+                if self.recipient_key_imported {
+                    if let Some(addr) = &self.peer_address {
+                        let is_typing = !is_empty;
+                        if was_empty != is_empty || is_typing {
+                            let envelope = network::MessageEnvelope::TypingIndicator { is_typing };
+                            let addr = addr.clone();
+                            let _ = std::thread::spawn(move || {
+                                let _ = network::NetworkHandle::send_message(&addr, envelope);
+                            });
+                        }
+                    }
+                }
                 Command::none()
             }
             Message::SendMessage => {
                 if self.message_input.trim().is_empty() || !self.recipient_key_imported {
                     return Command::none();
                 }
+                self.unread_count = 0; // Clear unread when user is active
                 let content = self.message_input.clone();
                 self.message_input.clear();
                 let new_msg = ChatMessage {
@@ -298,13 +338,29 @@ impl Application for CryptoChat {
                                     self.peer_username.clone().unwrap_or_else(|| "Peer".to_string())
                                 );
                                 let new_msg = ChatMessage {
-                                    sender_name: name,
-                                    content: plaintext,
+                                    sender_name: name.clone(),
+                                    content: plaintext.clone(),
                                     is_mine: false,
                                     timestamp: chrono_time(),
                                 };
                                 save_message_to_history(&new_msg);
                                 self.chat_messages.push(new_msg);
+                                
+                                // Show notification and play sound
+                                show_notification(&format!("Message from {}", name), &plaintext);
+                                play_notification_sound();
+                                self.unread_count += 1;
+                                self.peer_is_typing = false; // They sent, so not typing
+                                
+                                // Send read receipt
+                                if let Some(addr) = &self.peer_address {
+                                    let ts = chrono_time();
+                                    let envelope = network::MessageEnvelope::ReadReceipt { last_read_timestamp: ts };
+                                    let addr = addr.clone();
+                                    let _ = std::thread::spawn(move || {
+                                        let _ = network::NetworkHandle::send_message(&addr, envelope);
+                                    });
+                                }
                             }
                             Err(e) => self.status = format!("Decrypt error: {}", e),
                         }
@@ -321,6 +377,12 @@ impl Application for CryptoChat {
                                 self.status = format!("Auto-connected: {}", name);
                             }
                         }
+                    }
+                    network::NetworkEvent::TypingUpdate { is_typing } => {
+                        self.peer_is_typing = is_typing;
+                    }
+                    network::NetworkEvent::ReadReceiptReceived { last_read_timestamp } => {
+                        self.peer_last_read = Some(last_read_timestamp);
                     }
                     network::NetworkEvent::Error(e) => self.status = format!("Network: {}", e),
                 }
@@ -416,6 +478,38 @@ impl Application for CryptoChat {
                 self.status = "History cleared".to_string();
                 Command::none()
             }
+            Message::SelectContact(index) => {
+                if let Some(contact) = self.contacts.get(index) {
+                    // Set up connection to this contact
+                    if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&contact.public_key) {
+                        self.app_state.set_recipient_keypair(keypair);
+                        self.app_state.set_peer_address(contact.address.clone());
+                        self.peer_address = Some(contact.address.clone());
+                        self.peer_username = Some(contact.name.clone());
+                        self.recipient_key_imported = true;
+                        self.status = format!("Reconnected to {}!", contact.name);
+                        
+                        // Send our key so they can respond
+                        if let (Ok(Some(our_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
+                            let envelope = network::MessageEnvelope::AcceptedResponse {
+                                sender_fingerprint: our_key.fingerprint.clone(),
+                                sender_public_key: our_key.public_key_armored.clone(),
+                                sender_listening_port: port,
+                                sender_name: Some(self.my_username.clone()),
+                            };
+                            let peer_addr = contact.address.clone();
+                            return Command::perform(
+                                async move {
+                                    network::NetworkHandle::send_message(&peer_addr, envelope)
+                                        .map_err(|e| e.to_string())
+                                },
+                                |r| Message::MessageSent(r),
+                            );
+                        }
+                    }
+                }
+                Command::none()
+            }
         }
     }
 
@@ -464,6 +558,46 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
         let _ = CloseClipboard();
     }
     Ok(())
+}
+
+/// Show Windows toast notification
+fn show_notification(title: &str, message: &str) {
+    let ps_cmd = format!(
+        r#"
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$template = @"
+<toast>
+    <visual>
+        <binding template="ToastText02">
+            <text id="1">{}</text>
+            <text id="2">{}</text>
+        </binding>
+    </visual>
+    <audio src="ms-winsoundevent:Notification.IM"/>
+</toast>
+"@
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($template)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("CryptoChat").Show($toast)
+"#,
+        title.replace("\"", "'"),
+        message.replace("\"", "'").replace("\n", " ")
+    );
+    
+    let _ = std::process::Command::new("powershell")
+        .args(["-WindowStyle", "Hidden", "-Command", &ps_cmd])
+        .spawn();
+}
+
+/// Play notification sound using Windows IM notification
+fn play_notification_sound() {
+    // Use Windows Media Player to play system notification sound
+    let _ = std::process::Command::new("powershell")
+        .args(["-WindowStyle", "Hidden", "-Command", 
+            r#"(New-Object Media.SoundPlayer "C:\Windows\Media\Windows Notify Email.wav").PlaySync()"#])
+        .spawn();
 }
 
 fn copy_image_to_clipboard(img: &image::ImageBuffer<image::Luma<u8>, Vec<u8>>) -> Result<(), String> {
@@ -641,6 +775,19 @@ impl CryptoChat {
         
         let clear_btn = button(text("Clear History").size(10)).padding([4, 8]).on_press(Message::ClearHistory);
         
+        // Build contacts list
+        let contacts_section: Element<Message> = if self.contacts.is_empty() {
+            text("No saved contacts").size(9).into()
+        } else {
+            let contact_buttons: Vec<Element<Message>> = self.contacts.iter().enumerate().map(|(i, c)| {
+                button(text(&c.name).size(10))
+                    .padding([4, 8])
+                    .on_press(Message::SelectContact(i))
+                    .into()
+            }).collect();
+            column(contact_buttons).spacing(2).into()
+        };
+        
         let sidebar = container(
             column![
                 text("CryptoChat").size(16),
@@ -655,6 +802,9 @@ impl CryptoChat {
                 row![qr_btn].spacing(4),
                 Space::with_height(12),
                 import_section,
+                Space::with_height(12),
+                text("Contacts:").size(10),
+                contacts_section,
                 Space::with_height(Length::Fill),
                 clear_btn,
             ].padding(10).spacing(2)
@@ -678,6 +828,16 @@ impl CryptoChat {
             scrollable(column(bubbles).spacing(8).padding(16)).width(Length::Fill).height(Length::Fill).into()
         };
         
+        // Typing indicator
+        let typing_indicator: Element<Message> = if self.peer_is_typing {
+            let name = self.peer_username.as_deref().unwrap_or("Peer");
+            container(text(format!("{} is typing...", name)).size(12))
+                .padding([4, 16])
+                .into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
         // Input
         let can_send = self.recipient_key_imported;
         let input_row = if can_send {
@@ -698,6 +858,7 @@ impl CryptoChat {
         let chat_area = column![
             container(row![text("Chat").size(18), Space::with_width(Length::Fill), text(&self.status).size(10)].padding(10)),
             messages_view,
+            typing_indicator,
             input_row,
         ].width(Length::Fill).height(Length::Fill);
         

@@ -235,3 +235,46 @@ pub fn append_message(msg: &StoredMessage) -> Result<()> {
     history.push(msg.clone());
     save_chat_history(&history)
 }
+
+// ============ Simple Contacts ============
+
+/// Simple contact for quick reconnection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimpleContact {
+    pub name: String,
+    pub fingerprint: String,
+    pub public_key: String,
+    pub address: String,
+}
+
+fn get_simple_contacts_path() -> Result<PathBuf> {
+    Ok(get_data_dir()?.join("simple_contacts.json"))
+}
+
+/// Load simple contacts
+pub fn load_simple_contacts() -> Result<Vec<SimpleContact>> {
+    let path = get_simple_contacts_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let json = fs::read_to_string(&path)?;
+    let contacts: Vec<SimpleContact> = serde_json::from_str(&json).unwrap_or_default();
+    Ok(contacts)
+}
+
+/// Save all simple contacts
+pub fn save_simple_contacts(contacts: &[SimpleContact]) -> Result<()> {
+    let path = get_simple_contacts_path()?;
+    let json = serde_json::to_string_pretty(contacts)?;
+    fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Add or update a simple contact
+pub fn upsert_simple_contact(contact: &SimpleContact) -> Result<()> {
+    let mut contacts = load_simple_contacts().unwrap_or_default();
+    // Remove existing with same fingerprint
+    contacts.retain(|c| c.fingerprint != contact.fingerprint);
+    contacts.push(contact.clone());
+    save_simple_contacts(&contacts)
+}

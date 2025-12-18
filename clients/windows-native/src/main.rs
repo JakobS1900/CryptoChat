@@ -15,6 +15,22 @@ use tokio::sync::mpsc;
 static INSTANCE_ID: OnceLock<Option<u32>> = OnceLock::new();
 static NETWORK_RECEIVER: OnceLock<Mutex<Option<mpsc::UnboundedReceiver<network::NetworkEvent>>>> = OnceLock::new();
 
+/// Emoji list for :emoji: autocomplete (name, emoji)
+const EMOJI_LIST: &[(&str, &str)] = &[
+    ("smile", "😀"), ("grin", "😁"), ("joy", "😂"), ("rofl", "🤣"),
+    ("blush", "😊"), ("heart_eyes", "😍"), ("kiss", "😘"), ("wink", "😉"),
+    ("thinking", "🤔"), ("neutral", "😐"), ("expressionless", "😑"), ("unamused", "😒"),
+    ("sweat", "😓"), ("sad", "😢"), ("cry", "😭"), ("angry", "😠"),
+    ("rage", "😡"), ("cool", "😎"), ("nerd", "🤓"), ("sunglasses", "🕶️"),
+    ("thumbsup", "👍"), ("thumbsdown", "👎"), ("clap", "👏"), ("wave", "👋"),
+    ("pray", "🙏"), ("muscle", "💪"), ("fire", "🔥"), ("heart", "❤️"),
+    ("star", "⭐"), ("sparkles", "✨"), ("party", "🎉"), ("100", "💯"),
+    ("check", "✅"), ("x", "❌"), ("warning", "⚠️"), ("question", "❓"),
+    ("exclamation", "❗"), ("zzz", "💤"), ("eyes", "👀"), ("brain", "🧠"),
+    ("rocket", "🚀"), ("money", "💰"), ("gem", "💎"), ("crown", "👑"),
+    ("skull", "💀"), ("ghost", "👻"), ("alien", "👽"), ("robot", "🤖"),
+];
+
 pub fn get_instance_id() -> Option<u32> {
     INSTANCE_ID.get().copied().flatten()
 }
@@ -52,6 +68,8 @@ pub struct CryptoChat {
     peer_last_read: Option<String>,
     /// Show emoji picker panel
     show_emoji_picker: bool,
+    /// Emoji suggestions for :emoji: autocomplete
+    emoji_suggestions: Vec<(&'static str, &'static str)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +111,8 @@ pub enum Message {
     FileSent(Result<(), String>),
     ToggleEmojiPicker,
     InsertEmoji(String),
+    /// Select emoji from :emoji: autocomplete (name, emoji)
+    SelectEmojiSuggestion(String, String),
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +174,7 @@ impl Application for CryptoChat {
                 peer_is_typing: false,
                 peer_last_read: None,
                 show_emoji_picker: false,
+                emoji_suggestions: Vec::new(),
             },
             init_command,
         )
@@ -291,6 +312,21 @@ impl Application for CryptoChat {
                 let was_empty = self.message_input.is_empty();
                 self.message_input = value.clone();
                 let is_empty = self.message_input.is_empty();
+                
+                // Discord-style :emoji: autocomplete
+                self.emoji_suggestions.clear();
+                if let Some(colon_pos) = value.rfind(':') {
+                    let after_colon = &value[colon_pos + 1..];
+                    // Only show suggestions if we have at least 2 chars after : and no space
+                    if after_colon.len() >= 2 && !after_colon.contains(' ') {
+                        let query = after_colon.to_lowercase();
+                        self.emoji_suggestions = EMOJI_LIST.iter()
+                            .filter(|(name, _)| name.contains(&query.as_str()))
+                            .take(8)
+                            .copied()
+                            .collect();
+                    }
+                }
                 
                 // Send typing indicator when user starts/stops typing
                 if self.recipient_key_imported {
@@ -579,6 +615,15 @@ impl Application for CryptoChat {
             Message::InsertEmoji(emoji) => {
                 self.message_input.push_str(&emoji);
                 self.show_emoji_picker = false;
+                Command::none()
+            }
+            Message::SelectEmojiSuggestion(_name, emoji) => {
+                // Replace :text with emoji
+                if let Some(colon_pos) = self.message_input.rfind(':') {
+                    self.message_input.truncate(colon_pos);
+                    self.message_input.push_str(&emoji);
+                }
+                self.emoji_suggestions.clear();
                 Command::none()
             }
         }
@@ -970,8 +1015,8 @@ impl CryptoChat {
         let can_send = self.recipient_key_imported;
         let input_row = if can_send {
             row![
-                button(text("📎")).padding([10, 12]).on_press(Message::PickFile),
-                button(text("😀")).padding([10, 12]).on_press(Message::ToggleEmojiPicker),
+                button(text("File").size(12)).padding([10, 12]).on_press(Message::PickFile),
+                button(text("Emoji").size(12)).padding([10, 12]).on_press(Message::ToggleEmojiPicker),
                 text_input("Type a message...", &self.message_input)
                     .on_input(Message::MessageInputChanged)
                     .on_submit(Message::SendMessage)
@@ -1002,11 +1047,32 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
+        // Discord-style :emoji: suggestions dropdown
+        let emoji_suggestions_panel: Element<Message> = if !self.emoji_suggestions.is_empty() {
+            let suggestion_items: Vec<Element<Message>> = self.emoji_suggestions.iter().map(|(name, emoji)| {
+                button(
+                    row![
+                        text(*emoji).size(16),
+                        text(format!(":{name}:")).size(12),
+                    ].spacing(8)
+                )
+                .padding([6, 12])
+                .on_press(Message::SelectEmojiSuggestion(name.to_string(), emoji.to_string()))
+                .into()
+            }).collect();
+            container(
+                column(suggestion_items).spacing(2).padding(8)
+            ).into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
         let chat_area = column![
             container(row![text("Chat").size(18), Space::with_width(Length::Fill), text(&self.status).size(10)].padding(10)),
             messages_view,
             typing_indicator,
             emoji_picker,
+            emoji_suggestions_panel,
             input_row,
         ].width(Length::Fill).height(Length::Fill);
         

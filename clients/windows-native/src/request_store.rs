@@ -278,3 +278,20 @@ pub fn upsert_simple_contact(contact: &SimpleContact) -> Result<()> {
     contacts.push(contact.clone());
     save_simple_contacts(&contacts)
 }
+
+/// Update contact name by fingerprint (returns true if updated)
+pub fn update_contact_name(fingerprint: &str, new_name: &str) -> Result<bool> {
+    let mut contacts = load_simple_contacts().unwrap_or_default();
+    let mut updated = false;
+    for contact in contacts.iter_mut() {
+        if contact.fingerprint == fingerprint && contact.name != new_name {
+            contact.name = new_name.to_string();
+            updated = true;
+            break;
+        }
+    }
+    if updated {
+        save_simple_contacts(&contacts)?;
+    }
+    Ok(updated)
+}

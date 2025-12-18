@@ -139,6 +139,8 @@ pub enum Message {
     AcceptRequest(usize),
     /// Decline a pending connection request (index in pending_requests)
     DeclineRequest(usize),
+    /// Add current peer to saved contacts
+    AddToContacts,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +437,20 @@ impl Application for CryptoChat {
                                     let _ = std::thread::spawn(move || {
                                         let _ = network::NetworkHandle::send_message(&addr, envelope);
                                     });
+                                }
+                                
+                                // Sync username if changed
+                                self.peer_username = Some(name.clone());
+                                if let Ok(Some(r)) = self.app_state.get_recipient_keypair() {
+                                    let fp = r.fingerprint();
+                                    // Update in-memory contacts
+                                    for c in self.contacts.iter_mut() {
+                                        if c.fingerprint == fp && c.name != name {
+                                            c.name = name.clone();
+                                        }
+                                    }
+                                    // Update on disk
+                                    let _ = request_store::update_contact_name(&fp, &name);
                                 }
                             }
                             Err(e) => self.status = format!("Decrypt error: {}", e),
@@ -785,6 +801,34 @@ impl Application for CryptoChat {
                     let req = self.pending_requests.remove(idx);
                     let name = req.sender_name.unwrap_or_else(|| req.sender_fingerprint[..8].to_string());
                     self.status = format!("Declined request from {}", name);
+                }
+                Command::none()
+            }
+            Message::AddToContacts => {
+                // Add current peer to contacts
+                if self.recipient_key_imported {
+                    if let Ok(Some(recipient)) = self.app_state.get_recipient_keypair() {
+                        let fingerprint = recipient.fingerprint();
+                        let name = self.peer_username.clone().unwrap_or_else(|| fingerprint[..8].to_string());
+                        let address = self.peer_address.clone().unwrap_or_default();
+                        
+                        // Check if already in contacts
+                        let already_saved = self.contacts.iter().any(|c| c.fingerprint == fingerprint);
+                        if already_saved {
+                            self.status = format!("{} is already in contacts", name);
+                        } else {
+                            let contact = request_store::SimpleContact {
+                                name: name.clone(),
+                                fingerprint: fingerprint.clone(),
+                                public_key: recipient.export_public_key().unwrap_or_default(),
+                                address,
+                            };
+                            if let Ok(()) = request_store::upsert_simple_contact(&contact) {
+                                self.contacts.push(contact);
+                                self.status = format!("Added {} to contacts!", name);
+                            }
+                        }
+                    }
                 }
                 Command::none()
             }
@@ -1273,9 +1317,24 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
-        // Simple chat header with status
+        // Simple chat header with status and Add Contact button
+        // Show button if connected but peer not in contacts
+        let peer_name = self.peer_username.clone().unwrap_or_else(|| "Unknown".to_string());
+        let peer_in_contacts = self.contacts.iter().any(|c| c.name == peer_name);
+        
+        let add_contact_btn: Element<Message> = if self.recipient_key_imported && !peer_in_contacts {
+            button(text(format!("+ Add {}", peer_name)).size(10))
+                .padding([4, 8])
+                .on_press(Message::AddToContacts)
+                .into()
+        } else {
+            Space::with_width(0).into()
+        };
+        
         let header_content = row![
             text("Chat").size(18), 
+            Space::with_width(8),
+            add_contact_btn,
             Space::with_width(Length::Fill), 
             text(&self.status).size(10)
         ].padding(10);

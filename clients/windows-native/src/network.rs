@@ -29,6 +29,11 @@ pub enum NetworkEvent {
     ReadReceiptReceived {
         last_read_timestamp: String,
     },
+    FileReceived {
+        filename: String,
+        encrypted_data: String,
+        sender_name: Option<String>,
+    },
     Error(String),
 }
 
@@ -60,6 +65,13 @@ pub enum MessageEnvelope {
     ReadReceipt {
         /// Timestamp of the last read message
         last_read_timestamp: String,
+    },
+    /// Encrypted file transfer
+    FileMessage {
+        filename: String,
+        /// Base64-encoded encrypted file data
+        encrypted_data: String,
+        sender_name: Option<String>,
     },
 }
 
@@ -160,6 +172,9 @@ fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<Netw
         }
         MessageEnvelope::ReadReceipt { last_read_timestamp } => {
             let _ = sender.send(NetworkEvent::ReadReceiptReceived { last_read_timestamp });
+        }
+        MessageEnvelope::FileMessage { filename, encrypted_data, sender_name } => {
+            let _ = sender.send(NetworkEvent::FileReceived { filename, encrypted_data, sender_name });
         }
     }
     Ok(())

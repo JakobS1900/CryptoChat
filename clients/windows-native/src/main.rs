@@ -50,6 +50,8 @@ pub struct CryptoChat {
     peer_is_typing: bool,
     /// Last read timestamp from peer (for ✓✓)
     peer_last_read: Option<String>,
+    /// Show emoji picker panel
+    show_emoji_picker: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +89,10 @@ pub enum Message {
     PollNetwork,
     ClearHistory,
     SelectContact(usize),
+    PickFile,
+    FileSent(Result<(), String>),
+    ToggleEmojiPicker,
+    InsertEmoji(String),
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +153,7 @@ impl Application for CryptoChat {
                 unread_count: 0,
                 peer_is_typing: false,
                 peer_last_read: None,
+                show_emoji_picker: false,
             },
             init_command,
         )
@@ -384,6 +391,36 @@ impl Application for CryptoChat {
                     network::NetworkEvent::ReadReceiptReceived { last_read_timestamp } => {
                         self.peer_last_read = Some(last_read_timestamp);
                     }
+                    network::NetworkEvent::FileReceived { filename, encrypted_data, sender_name } => {
+                        // Decrypt and save file
+                        use base64::Engine;
+                        if let Ok(Some(my_key)) = keystore::load_keypair() {
+                            if let Ok(data_bytes) = base64::engine::general_purpose::STANDARD.decode(&encrypted_data) {
+                                if let Ok(decrypted) = my_key.decrypt(&data_bytes) {
+                                    // Save to downloads folder
+                                    let downloads_dir = format!("{}\\Downloads", std::env::var("USERPROFILE").unwrap_or_default());
+                                    let save_path = format!("{}\\{}", downloads_dir, filename);
+                                    if let Err(e) = std::fs::write(&save_path, &decrypted) {
+                                        self.status = format!("Save failed: {}", e);
+                                    } else {
+                                        let name = sender_name.unwrap_or_else(|| self.peer_username.clone().unwrap_or_else(|| "Peer".to_string()));
+                                        let new_msg = ChatMessage {
+                                            sender_name: name.clone(),
+                                            content: format!("📎 File: {} (saved to Downloads)", filename),
+                                            is_mine: false,
+                                            timestamp: chrono_time(),
+                                        };
+                                        save_message_to_history(&new_msg);
+                                        self.chat_messages.push(new_msg);
+                                        show_notification(&format!("File from {}", name), &format!("Received: {}", filename));
+                                        play_notification_sound();
+                                        self.unread_count += 1;
+                                        self.peer_is_typing = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     network::NetworkEvent::Error(e) => self.status = format!("Network: {}", e),
                 }
                 Command::none()
@@ -510,6 +547,40 @@ impl Application for CryptoChat {
                 }
                 Command::none()
             }
+            Message::PickFile => {
+                if !self.recipient_key_imported {
+                    self.status = "Connect to a peer first".to_string();
+                    return Command::none();
+                }
+                // Use PowerShell to open file picker
+                let app_state = self.app_state.clone();
+                let peer_addr = self.peer_address.clone();
+                let sender_name = self.my_username.clone();
+                return Command::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            pick_and_send_file(app_state, peer_addr, sender_name)
+                        }).await.map_err(|e| e.to_string())?
+                    },
+                    |r| Message::FileSent(r),
+                );
+            }
+            Message::FileSent(result) => {
+                match result {
+                    Ok(()) => self.status = "File sent!".to_string(),
+                    Err(e) => self.status = format!("File send failed: {}", e),
+                }
+                Command::none()
+            }
+            Message::ToggleEmojiPicker => {
+                self.show_emoji_picker = !self.show_emoji_picker;
+                Command::none()
+            }
+            Message::InsertEmoji(emoji) => {
+                self.message_input.push_str(&emoji);
+                self.show_emoji_picker = false;
+                Command::none()
+            }
         }
     }
 
@@ -558,6 +629,63 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
         let _ = CloseClipboard();
     }
     Ok(())
+}
+
+/// Pick and send an encrypted file
+fn pick_and_send_file(
+    app_state: Arc<app::AppState>,
+    peer_addr: Option<String>,
+    sender_name: String,
+) -> Result<(), String> {
+    let peer_addr = peer_addr.ok_or("No peer connected")?;
+    
+    // Use PowerShell to open file picker
+    let ps_cmd = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Select file to send'
+$dialog.Filter = 'All Files (*.*)|*.*'
+if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName } else { '' }
+"#;
+    
+    let output = std::process::Command::new("powershell")
+        .args(["-WindowStyle", "Hidden", "-Command", ps_cmd])
+        .output()
+        .map_err(|e| format!("File picker failed: {}", e))?;
+    
+    let file_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if file_path.is_empty() {
+        return Err("No file selected".into());
+    }
+    
+    // Read file
+    let file_data = std::fs::read(&file_path)
+        .map_err(|e| format!("Read failed: {}", e))?;
+    
+    let filename = std::path::Path::new(&file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    
+    // Encrypt with recipient's public key
+    let recipient_key = app_state.recipient_keypair.read().unwrap();
+    let recipient = recipient_key.as_ref().ok_or("No recipient key")?;
+    let encrypted = recipient.encrypt(&file_data)
+        .map_err(|e| format!("Encrypt failed: {}", e))?;
+    
+    // Encode as base64
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+    
+    // Send file message
+    let envelope = network::MessageEnvelope::FileMessage {
+        filename,
+        encrypted_data: encoded,
+        sender_name: Some(sender_name),
+    };
+    
+    network::NetworkHandle::send_message(&peer_addr, envelope)
+        .map_err(|e| format!("Send failed: {}", e))
 }
 
 /// Show Windows toast notification
@@ -842,6 +970,8 @@ impl CryptoChat {
         let can_send = self.recipient_key_imported;
         let input_row = if can_send {
             row![
+                button(text("📎")).padding([10, 12]).on_press(Message::PickFile),
+                button(text("😀")).padding([10, 12]).on_press(Message::ToggleEmojiPicker),
                 text_input("Type a message...", &self.message_input)
                     .on_input(Message::MessageInputChanged)
                     .on_submit(Message::SendMessage)
@@ -855,10 +985,28 @@ impl CryptoChat {
             ].spacing(8).padding(12)
         };
         
+        // Emoji picker panel
+        let emoji_picker: Element<Message> = if self.show_emoji_picker {
+            let emojis = ["😀", "😂", "🥰", "😎", "🤔", "😢", "😡", "👍", "👎", "❤️", 
+                          "🔥", "⭐", "🎉", "👋", "🙏", "💪", "🤝", "✅", "❌", "💯"];
+            let emoji_buttons: Vec<Element<Message>> = emojis.iter().map(|e| {
+                button(text(*e).size(20))
+                    .padding([4, 8])
+                    .on_press(Message::InsertEmoji(e.to_string()))
+                    .into()
+            }).collect();
+            container(
+                row(emoji_buttons).spacing(4).padding(8)
+            ).into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
         let chat_area = column![
             container(row![text("Chat").size(18), Space::with_width(Length::Fill), text(&self.status).size(10)].padding(10)),
             messages_view,
             typing_indicator,
+            emoji_picker,
             input_row,
         ].width(Length::Fill).height(Length::Fill);
         

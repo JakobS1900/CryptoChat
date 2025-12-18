@@ -69,6 +69,8 @@ pub struct CryptoChat {
     emoji_suggestions: Vec<(&'static str, &'static str)>,
     /// Dark mode enabled (false = light mode)
     dark_mode: bool,
+    /// Pending connection requests awaiting user approval
+    pending_requests: Vec<PendingRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +89,16 @@ pub struct ChatMessage {
     pub image_data: Option<Vec<u8>>,
     /// Filename for images (used for save button)
     pub image_filename: Option<String>,
+}
+
+/// Pending connection request waiting for user approval
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    pub sender_fingerprint: String,
+    pub sender_public_key: String,
+    pub sender_address: String,
+    pub sender_name: Option<String>,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +135,10 @@ pub enum Message {
     SaveImage(usize),
     /// Toggle between light and dark mode
     ToggleTheme,
+    /// Accept a pending connection request (index in pending_requests)
+    AcceptRequest(usize),
+    /// Decline a pending connection request (index in pending_requests)
+    DeclineRequest(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +202,7 @@ impl Application for CryptoChat {
                 show_emoji_picker: false,
                 emoji_suggestions: Vec::new(),
                 dark_mode: true,  // Default to dark mode
+                pending_requests: Vec::new(),
             },
             init_command,
         )
@@ -424,16 +441,23 @@ impl Application for CryptoChat {
                         }
                     }
                     network::NetworkEvent::RequestReceived { sender_fingerprint, sender_public_key, sender_address, sender_name } => {
-                        if !self.recipient_key_imported {
-                            if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&sender_public_key) {
-                                self.app_state.set_recipient_keypair(keypair);
-                                self.app_state.set_peer_address(sender_address.clone());
-                                self.peer_address = Some(sender_address);
-                                self.peer_username = sender_name.clone();
-                                self.recipient_key_imported = true;
-                                let name = sender_name.unwrap_or_else(|| sender_fingerprint[..8].to_string());
-                                self.status = format!("Auto-connected: {}", name);
-                            }
+                        // Add to pending requests instead of auto-connecting
+                        let name = sender_name.clone().unwrap_or_else(|| sender_fingerprint[..8].to_string());
+                        
+                        // Check if we already have this request pending
+                        let already_pending = self.pending_requests.iter().any(|r| r.sender_fingerprint == sender_fingerprint);
+                        if !already_pending {
+                            let pending = PendingRequest {
+                                sender_fingerprint: sender_fingerprint.clone(),
+                                sender_public_key,
+                                sender_address,
+                                sender_name,
+                                timestamp: chrono_time(),
+                            };
+                            self.pending_requests.push(pending);
+                            show_notification("Connection Request", &format!("{} wants to chat", name));
+                            play_notification_sound();
+                            self.status = format!("Request from: {} (Accept/Decline)", name);
                         }
                     }
                     network::NetworkEvent::TypingUpdate { is_typing } => {
@@ -735,6 +759,33 @@ impl Application for CryptoChat {
             }
             Message::ToggleTheme => {
                 self.dark_mode = !self.dark_mode;
+                Command::none()
+            }
+            Message::AcceptRequest(idx) => {
+                if idx < self.pending_requests.len() {
+                    let req = self.pending_requests.remove(idx);
+                    let name = req.sender_name.clone().unwrap_or_else(|| req.sender_fingerprint[..8].to_string());
+                    
+                    if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&req.sender_public_key) {
+                        self.app_state.set_recipient_keypair(keypair);
+                        self.app_state.set_peer_address(req.sender_address.clone());
+                        self.peer_address = Some(req.sender_address);
+                        self.peer_username = req.sender_name;
+                        self.recipient_key_imported = true;
+                        self.status = format!("Connected: {}", name);
+                        self.view = View::Chat;
+                    } else {
+                        self.status = format!("Failed to import key from {}", name);
+                    }
+                }
+                Command::none()
+            }
+            Message::DeclineRequest(idx) => {
+                if idx < self.pending_requests.len() {
+                    let req = self.pending_requests.remove(idx);
+                    let name = req.sender_name.unwrap_or_else(|| req.sender_fingerprint[..8].to_string());
+                    self.status = format!("Declined request from {}", name);
+                }
                 Command::none()
             }
         }
@@ -1070,6 +1121,26 @@ impl CryptoChat {
         let theme_label = if self.dark_mode { "Light Mode" } else { "Dark Mode" };
         let theme_btn = button(text(theme_label).size(10)).padding([4, 8]).on_press(Message::ToggleTheme);
         
+        // Pending connection requests with Accept/Decline
+        let pending_section: Element<Message> = if self.pending_requests.is_empty() {
+            Space::with_height(0).into()
+        } else {
+            let pending_rows: Vec<Element<Message>> = self.pending_requests.iter().enumerate().map(|(i, req)| {
+                let name = req.sender_name.clone().unwrap_or_else(|| req.sender_fingerprint[..8].to_string());
+                column![
+                    text(format!("{} wants to chat", name)).size(10),
+                    row![
+                        button(text("Accept").size(9)).padding([3, 6]).on_press(Message::AcceptRequest(i)),
+                        button(text("Decline").size(9)).padding([3, 6]).on_press(Message::DeclineRequest(i)),
+                    ].spacing(4),
+                ].spacing(2).into()
+            }).collect();
+            column![
+                text("Pending Requests:").size(10),
+                column(pending_rows).spacing(4),
+            ].spacing(4).into()
+        };
+        
         // Build contacts list with delete buttons
         let contacts_section: Element<Message> = if self.contacts.is_empty() {
             text("No saved contacts").size(9).into()
@@ -1102,6 +1173,7 @@ impl CryptoChat {
                 Space::with_height(12),
                 import_section,
                 Space::with_height(12),
+                pending_section,
                 text("Contacts:").size(10),
                 contacts_section,
                 Space::with_height(Length::Fill),

@@ -77,6 +77,19 @@ impl AppState {
         }
     }
 
+    /// Export keypair data for account migration (secret_key, public_key, fingerprint)
+    pub fn get_keypair_for_export(&self) -> Option<(String, String, String)> {
+        let keypair_guard = self.keypair.read().unwrap();
+        if let Some(ref kp) = *keypair_guard {
+            let secret_key = kp.export_secret_key().ok()?;
+            let public_key = kp.export_public_key().ok()?;
+            let fingerprint = kp.fingerprint();
+            Some((secret_key, public_key, fingerprint))
+        } else {
+            None
+        }
+    }
+
     pub fn set_peer_address(&self, address: String) {
         *self.peer_address.write().unwrap() = Some(address);
     }

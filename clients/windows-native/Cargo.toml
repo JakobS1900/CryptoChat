@@ -45,6 +45,14 @@ rqrr = "0.7"
 
 # Utilities
 uuid = { version = "1.7", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Symmetric encryption for chat storage
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+sha2 = "0.10"
+rand = "0.8"
+argon2 = "0.5.3"
 
 [build-dependencies]
 embed-resource = "2.4"

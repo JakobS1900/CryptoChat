@@ -28,7 +28,7 @@ struct ContactStore {
 }
 
 /// Get the data directory for CryptoChat
-fn get_data_dir() -> Result<PathBuf> {
+pub fn get_data_dir() -> Result<PathBuf> {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .context("Could not find home directory")?;
@@ -57,6 +57,33 @@ fn get_requests_path() -> Result<PathBuf> {
 /// Get path to contacts.json
 fn get_contacts_path() -> Result<PathBuf> {
     Ok(get_data_dir()?.join("contacts.json"))
+}
+
+/// Get path to username.txt
+fn get_username_path() -> Result<PathBuf> {
+    Ok(get_data_dir()?.join("username.txt"))
+}
+
+/// Save username to file
+pub fn save_username(username: &str) -> Result<()> {
+    let path = get_username_path()?;
+    fs::write(&path, username).context("Failed to save username")?;
+    Ok(())
+}
+
+/// Load username from file
+pub fn load_username() -> Result<Option<String>> {
+    let path = get_username_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let username = fs::read_to_string(&path).context("Failed to read username")?;
+    let trimmed = username.trim().to_string();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed))
+    }
 }
 
 /// Load all message requests from disk
@@ -203,14 +230,87 @@ pub struct StoredMessage {
     pub content: String,
     pub is_mine: bool,
     pub timestamp: String,
+    /// Optional expiration for disappearing messages (ISO8601)
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
-/// Get path to chat_history.json
+/// Get path to chat_history.json (legacy unencrypted)
 fn get_history_path() -> Result<PathBuf> {
     Ok(get_data_dir()?.join("chat_history.json"))
 }
 
-/// Load chat history from disk
+/// Get path to encrypted chat history
+fn get_encrypted_history_path() -> Result<PathBuf> {
+    Ok(get_data_dir()?.join("chat_history.enc"))
+}
+
+/// Load chat history - tries encrypted first, falls back to unencrypted for migration
+pub fn load_chat_history_encrypted(fingerprint: &str) -> Result<Vec<StoredMessage>> {
+    use crate::encrypted_storage;
+    
+    let enc_path = get_encrypted_history_path()?;
+    
+    // If encrypted file exists, use it
+    if enc_path.exists() {
+        let stored = encrypted_storage::load_encrypted_history(fingerprint)?;
+        // Convert from encrypted_storage::StoredMessage to our StoredMessage
+        return Ok(stored.into_iter().map(|m| StoredMessage {
+            sender_name: m.sender_name,
+            content: m.content,
+            is_mine: m.is_mine,
+            timestamp: m.timestamp,
+            expires_at: m.expires_at,
+        }).collect());
+    }
+    
+    // Check for unencrypted file to migrate
+    let plain_path = get_history_path()?;
+    if plain_path.exists() {
+        // Load old unencrypted history
+        let json = fs::read_to_string(&plain_path).context("Failed to read chat history")?;
+        let messages: Vec<StoredMessage> = serde_json::from_str(&json).unwrap_or_default();
+        
+        // Migrate to encrypted format
+        let _ = save_chat_history_encrypted(&messages, fingerprint);
+        
+        // Delete old unencrypted file for security
+        let _ = fs::remove_file(&plain_path);
+        
+        return Ok(messages);
+    }
+    
+    Ok(Vec::new())
+}
+
+/// Save chat history with encryption
+pub fn save_chat_history_encrypted(messages: &[StoredMessage], fingerprint: &str) -> Result<()> {
+    use crate::encrypted_storage;
+    
+    // Convert to encrypted_storage format
+    let stored: Vec<encrypted_storage::StoredMessage> = messages.iter().map(|m| {
+        encrypted_storage::StoredMessage {
+            sender_name: m.sender_name.clone(),
+            content: m.content.clone(),
+            is_mine: m.is_mine,
+            timestamp: m.timestamp.clone(),
+            expires_at: m.expires_at.clone(),
+            image_data: None,
+            image_filename: None,
+        }
+    }).collect();
+    
+    encrypted_storage::save_encrypted_history(&stored, fingerprint)
+}
+
+/// Append a message to encrypted chat history
+pub fn append_message_encrypted(msg: &StoredMessage, fingerprint: &str) -> Result<()> {
+    let mut history = load_chat_history_encrypted(fingerprint).unwrap_or_default();
+    history.push(msg.clone());
+    save_chat_history_encrypted(&history, fingerprint)
+}
+
+/// Legacy: Load chat history from disk (unencrypted - for backwards compatibility)
 pub fn load_chat_history() -> Result<Vec<StoredMessage>> {
     let path = get_history_path()?;
     if !path.exists() {
@@ -221,7 +321,7 @@ pub fn load_chat_history() -> Result<Vec<StoredMessage>> {
     Ok(messages)
 }
 
-/// Save chat history to disk
+/// Legacy: Save chat history to disk (unencrypted)
 pub fn save_chat_history(messages: &[StoredMessage]) -> Result<()> {
     let path = get_history_path()?;
     let json = serde_json::to_string_pretty(messages)?;

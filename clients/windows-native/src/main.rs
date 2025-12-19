@@ -1,6 +1,9 @@
 //! CryptoChat Windows Native Client - Modern UI with Chat Bubbles
 
+mod account_store;
 mod app;
+mod encrypted_storage;
+mod group_store;
 mod keystore;
 mod network;
 mod qr_exchange;
@@ -71,10 +74,25 @@ pub struct CryptoChat {
     dark_mode: bool,
     /// Pending connection requests awaiting user approval
     pending_requests: Vec<PendingRequest>,
+    /// List of groups the user is in
+    groups: Vec<group_store::Group>,
+    /// Group pending deletion (for confirmation dialog)
+    pending_group_delete: Option<String>,
+    /// Group invite input for joining groups
+    group_invite_input: String,
+    /// Currently selected group for messaging (None = direct chat)
+    selected_group_id: Option<String>,
+    /// Password input for login/create account
+    password_input: String,
+    /// Confirm password input for account creation
+    confirm_password_input: String,
+    /// Login error message
+    login_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
+    Login,
     Onboarding,
     Chat,
 }
@@ -141,6 +159,32 @@ pub enum Message {
     DeclineRequest(usize),
     /// Add current peer to saved contacts
     AddToContacts,
+    /// Create a new group chat
+    CreateGroup,
+    /// Select a group from the list (group_id)
+    SelectGroup(String),
+    /// Copy group invite key to clipboard
+    CopyGroupKey(String),
+    /// Request to delete a group (shows confirmation)
+    RequestDeleteGroup(String),
+    /// Confirm group deletion
+    ConfirmDeleteGroup(String),
+    /// Cancel group deletion
+    CancelDeleteGroup,
+    /// Group invite input changed
+    GroupInviteInputChanged(String),
+    /// Join a group from invite JSON
+    JoinGroup,
+    /// Password input changed
+    PasswordInputChanged(String),
+    /// Confirm password input changed
+    ConfirmPasswordChanged(String),
+    /// Login attempt
+    Login,
+    /// Create new account
+    CreateAccount,
+    /// Login result
+    LoginResult(Result<(), String>),
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +208,14 @@ impl Application for CryptoChat {
     fn new(_flags: ()) -> (Self, Command<Message>) {
         let app_state = Arc::new(app::AppState::new());
         
-        let has_keys = if let Ok(Some(stored_key)) = keystore::load_keypair() {
+        // Check if account exists (needs login)
+        let has_account = account_store::account_exists();
+        
+        // Load keys if account exists (will decrypt after login) or from legacy keystore
+        let has_keys = if has_account {
+            false // Will load after login
+        } else if let Ok(Some(stored_key)) = keystore::load_keypair() {
+            // Legacy keys exist - load them but still show account creation to secure them
             if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_secret_key(&stored_key.secret_key_armored) {
                 if keypair.fingerprint() == stored_key.fingerprint {
                     app_state.set_keypair(keypair);
@@ -173,8 +224,13 @@ impl Application for CryptoChat {
             } else { false }
         } else { false };
         
-        let view = if has_keys { View::Chat } else { View::Onboarding };
-        let default_username = format!("User{}", get_instance_id().unwrap_or(1));
+        // Determine initial view:
+        // - has_account → Login (enter password)
+        // - has_keys but no account → Login (to create password for existing keys)
+        // - no keys → Onboarding (generate new keys)
+        let view = if has_account || has_keys { View::Login } else { View::Onboarding };
+        let saved_username = request_store::load_username().ok().flatten();
+        let default_username = saved_username.unwrap_or_else(|| format!("User{}", get_instance_id().unwrap_or(1)));
         
         let init_command = if has_keys {
             Command::perform(async { start_network_async().await }, Message::NetworkStarted)
@@ -205,6 +261,13 @@ impl Application for CryptoChat {
                 emoji_suggestions: Vec::new(),
                 dark_mode: true,  // Default to dark mode
                 pending_requests: Vec::new(),
+                groups: Vec::new(), // Will be loaded when fingerprint available
+                pending_group_delete: None,
+                group_invite_input: String::new(),
+                selected_group_id: None,
+                password_input: String::new(),
+                confirm_password_input: String::new(),
+                login_error: None,
             },
             init_command,
         )
@@ -260,7 +323,9 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::UsernameChanged(name) => {
-                self.my_username = name;
+                self.my_username = name.clone();
+                // Save username to disk for persistence
+                let _ = request_store::save_username(&name);
                 Command::none()
             }
             Message::CopyKeyShare => {
@@ -303,20 +368,27 @@ impl Application for CryptoChat {
                         self.app_state.set_peer_address(res.address.clone());
                         self.key_share_input.clear();
                         let peer_name = res.username.clone().unwrap_or_else(|| "Peer".to_string());
-                        self.status = format!("Connected to {}! Sending our key...", peer_name);
                         
-                        // Save contact for future reconnection
-                        let contact = request_store::SimpleContact {
-                            name: peer_name.clone(),
-                            fingerprint: res.fingerprint.clone(),
-                            public_key: self.app_state.recipient_keypair.read().unwrap()
-                                .as_ref().map(|k| k.export_public_key().unwrap_or_default()).unwrap_or_default(),
-                            address: res.address.clone(),
-                        };
-                        let _ = request_store::upsert_simple_contact(&contact);
-                        self.contacts = request_store::load_simple_contacts().unwrap_or_default();
+                        // Check if already in contacts (avoid duplicate connection)
+                        let already_saved = self.contacts.iter().any(|c| c.fingerprint == res.fingerprint);
+                        
+                        if !already_saved {
+                            // Save contact for future reconnection
+                            let contact = request_store::SimpleContact {
+                                name: peer_name.clone(),
+                                fingerprint: res.fingerprint.clone(),
+                                public_key: self.app_state.recipient_keypair.read().unwrap()
+                                    .as_ref().map(|k| k.export_public_key().unwrap_or_default()).unwrap_or_default(),
+                                address: res.address.clone(),
+                            };
+                            let _ = request_store::upsert_simple_contact(&contact);
+                            self.contacts = request_store::load_simple_contacts().unwrap_or_default();
+                        }
+                        
+                        self.status = format!("Connected to {}!", peer_name);
                         
                         // Send OUR public key to the peer so they can encrypt messages to us
+                        // Skip if we're already connected (prevents race conditions)
                         if let (Ok(Some(our_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
                             let envelope = network::MessageEnvelope::AcceptedResponse {
                                 sender_fingerprint: our_key.fingerprint.clone(),
@@ -374,7 +446,7 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::SendMessage => {
-                if self.message_input.trim().is_empty() || !self.recipient_key_imported {
+                if self.message_input.trim().is_empty() {
                     return Command::none();
                 }
                 self.unread_count = 0; // Clear unread when user is active
@@ -390,13 +462,57 @@ impl Application for CryptoChat {
                 };
                 save_message_to_history(&new_msg);
                 self.chat_messages.push(new_msg);
-                let app_state = self.app_state.clone();
-                let peer_addr = self.peer_address.clone().unwrap();
-                let username = self.my_username.clone();
-                Command::perform(
-                    async move { send_message_async(app_state, peer_addr, content, username).await },
-                    Message::MessageSent,
-                )
+                
+                // Route to group or direct peer
+                if let Some(ref group_id) = self.selected_group_id {
+                    // Group message mode - send to all members
+                    if let Some(group) = self.groups.iter().find(|g| &g.id == group_id) {
+                        let member_addresses: Vec<String> = group.members.iter()
+                            .filter(|m| m.fingerprint != self.app_state.get_fingerprint().unwrap_or_default())
+                            .map(|m| m.address.clone())
+                            .collect();
+                        
+                        if member_addresses.is_empty() {
+                            self.status = "No other members in group yet".to_string();
+                            return Command::none();
+                        }
+                        
+                        let username = self.my_username.clone();
+                        let group_id_clone = group_id.clone();
+                        let fingerprint = self.app_state.get_fingerprint().unwrap_or_default();
+                        let envelope = network::MessageEnvelope::GroupMessage {
+                            group_id: group_id_clone,
+                            sender_fingerprint: fingerprint,
+                            sender_name: username,
+                            encrypted_content: content, // TODO: encrypt with group key
+                            timestamp: chrono_time(),
+                            expires_at: None,
+                        };
+                        
+                        let (sent, failures) = network::NetworkHandle::send_to_group(&member_addresses, envelope);
+                        if failures.is_empty() {
+                            self.status = format!("Sent to {} members", sent);
+                        } else {
+                            self.status = format!("Sent to {}/{} members", sent, member_addresses.len());
+                        }
+                        Command::none()
+                    } else {
+                        self.status = "Group not found".to_string();
+                        Command::none()
+                    }
+                } else if self.recipient_key_imported {
+                    // Direct peer message
+                    let app_state = self.app_state.clone();
+                    let peer_addr = self.peer_address.clone().unwrap();
+                    let username = self.my_username.clone();
+                    Command::perform(
+                        async move { send_message_async(app_state, peer_addr, content, username).await },
+                        Message::MessageSent,
+                    )
+                } else {
+                    self.status = "Import a key or select a group first".to_string();
+                    Command::none()
+                }
             }
             Message::MessageSent(result) => {
                 if let Err(e) = result {
@@ -537,6 +653,84 @@ impl Application for CryptoChat {
                             }
                         }
                     }
+                    network::NetworkEvent::GroupInviteReceived { group_id, group_name, .. } => {
+                        // TODO: Implement pending group invites
+                        self.status = format!("Received invite to group: {}", group_name);
+                        show_notification("New Group Invite", &format!("Invited to {}", group_name));
+                        // Later: Add to pending_groups list
+                    }
+                    network::NetworkEvent::GroupMessageReceived { group_id, sender_fingerprint, sender_name, encrypted_content, timestamp, .. } => {
+                        // Add received group message to chat
+                        if let Some(group) = self.groups.iter().find(|g| g.id == group_id) {
+                            let new_msg = ChatMessage {
+                                sender_name: sender_name.clone(),
+                                content: encrypted_content, // TODO: decrypt with group key
+                                is_mine: false,
+                                timestamp,
+                                image_data: None,
+                                image_filename: None,
+                            };
+                            self.chat_messages.push(new_msg);
+                            show_notification(&format!("{} ({})", sender_name, group.name), "New group message");
+                            play_notification_sound();
+                            self.unread_count += 1;
+                        }
+                    }
+                    
+                    network::NetworkEvent::GroupJoinReceived { group_id, new_member, sender_address } => {
+                        // A new member joined - add them to our local group
+                        if let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) {
+                            // Check if member already exists
+                            if !group.members.iter().any(|m| m.fingerprint == new_member.fingerprint) {
+                                let new_name = new_member.username.clone();
+                                group.members.push(new_member);
+                                
+                                // Capture data before releasing mutable borrow
+                                let member_count = group.members.len();
+                                let members_clone = group.members.clone();
+                                let gid = group_id.clone();
+                                
+                                // Save updated group and send sync response
+                                if let Ok(Some(stored_key)) = keystore::load_keypair() {
+                                    let all_groups: Vec<_> = self.groups.iter().cloned().collect();
+                                    let _ = group_store::save_groups(&all_groups, &stored_key.fingerprint);
+                                    
+                                    // Send our full member list back to the new joiner
+                                    let sync_response = network::MessageEnvelope::GroupMemberSync {
+                                        group_id: gid,
+                                        members: members_clone,
+                                    };
+                                    let _ = network::NetworkHandle::send_message(&sender_address, sync_response);
+                                    
+                                    self.status = format!("{} joined the group ({} members)", new_name, member_count);
+                                }
+                            }
+                        }
+                    }
+                    
+                    network::NetworkEvent::GroupMemberSyncReceived { group_id, members } => {
+                        // Received member list from another member - merge it with ours
+                        if let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) {
+                            let mut updated = false;
+                            for member in members {
+                                if !group.members.iter().any(|m| m.fingerprint == member.fingerprint) {
+                                    group.members.push(member);
+                                    updated = true;
+                                }
+                            }
+                            
+                            let member_count = group.members.len();
+                            if updated {
+                                // Save updated group
+                                if let Ok(Some(stored_key)) = keystore::load_keypair() {
+                                    let all_groups: Vec<_> = self.groups.iter().cloned().collect();
+                                    let _ = group_store::save_groups(&all_groups, &stored_key.fingerprint);
+                                    self.status = format!("Synced with group - now {} members", member_count);
+                                }
+                            }
+                        }
+                    }
+                    
                     network::NetworkEvent::Error(e) => self.status = format!("Network: {}", e),
                 }
                 Command::none()
@@ -832,11 +1026,308 @@ impl Application for CryptoChat {
                 }
                 Command::none()
             }
+            Message::CreateGroup => {
+                // TODO: Show group creation modal
+                // For now, create a test group with self as only member
+                if let Ok(Some(stored_key)) = keystore::load_keypair() {
+                    let me = group_store::GroupMember {
+                        fingerprint: stored_key.fingerprint.clone(),
+                        username: self.my_username.clone(),
+                        public_key: stored_key.public_key_armored.clone(),
+                        address: format!("127.0.0.1:{}", self.listening_port.unwrap_or(62780)),
+                        joined_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    
+                    match group_store::create_group(
+                        format!("Group {}", self.groups.len() + 1),
+                        me,
+                        &stored_key.fingerprint,
+                    ) {
+                        Ok(group) => {
+                            self.status = format!("Created group: {}", group.name);
+                            // Auto-select the new group so creator can chat immediately
+                            self.selected_group_id = Some(group.id.clone());
+                            self.groups.push(group);
+                        }
+                        Err(e) => {
+                            self.status = format!("Failed to create group: {}", e);
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::SelectGroup(group_id) => {
+                // Switch to group chat mode
+                if let Some(group) = self.groups.iter().find(|g| g.id == group_id) {
+                    self.selected_group_id = Some(group_id);
+                    self.status = format!("Chatting in: {}", group.name);
+                } else {
+                    self.status = "Group not found".to_string();
+                }
+                Command::none()
+            }
+            Message::CopyGroupKey(group_id) => {
+                // Find the group and create a shareable invite with FULL member list
+                if let Some(group) = self.groups.iter().find(|g| g.id == group_id) {
+                    // Include full member list so new joiners know everyone
+                    let members_data: Vec<serde_json::Value> = group.members.iter().map(|m| {
+                        serde_json::json!({
+                            "fingerprint": m.fingerprint,
+                            "username": m.username,
+                            "public_key": m.public_key,
+                            "address": m.address,
+                        })
+                    }).collect();
+                    
+                    let invite = serde_json::json!({
+                        "type": "group_invite",
+                        "group_id": group.id,
+                        "group_name": group.name,
+                        "creator": self.my_username,
+                        "members": members_data,
+                    });
+                    if let Ok(invite_str) = serde_json::to_string(&invite) {
+                        let _ = copy_to_clipboard(&invite_str);
+                        self.status = format!("Copied invite for '{}' ({} members)", group.name, group.members.len());
+                    }
+                }
+                Command::none()
+            }
+            Message::RequestDeleteGroup(group_id) => {
+                // Set pending deletion - UI will show confirmation
+                self.pending_group_delete = Some(group_id);
+                Command::none()
+            }
+            Message::ConfirmDeleteGroup(group_id) => {
+                // Actually delete the group
+                if let Ok(Some(stored_key)) = keystore::load_keypair() {
+                    if let Err(e) = group_store::delete_group(&group_id, &stored_key.fingerprint) {
+                        self.status = format!("Delete failed: {}", e);
+                    } else {
+                        // Remove from memory
+                        if let Some(group) = self.groups.iter().find(|g| g.id == group_id) {
+                            let name = group.name.clone();
+                            self.groups.retain(|g| g.id != group_id);
+                            self.status = format!("Deleted group: {}", name);
+                        }
+                    }
+                }
+                self.pending_group_delete = None;
+                Command::none()
+            }
+            Message::CancelDeleteGroup => {
+                self.pending_group_delete = None;
+                Command::none()
+            }
+            Message::GroupInviteInputChanged(input) => {
+                self.group_invite_input = input;
+                Command::none()
+            }
+            Message::JoinGroup => {
+                // Parse the invite and add the group locally with ALL members
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&self.group_invite_input) {
+                    if json_val.get("type").and_then(|t| t.as_str()) == Some("group_invite") {
+                        let group_id = json_val.get("group_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let group_name = json_val.get("group_name").and_then(|v| v.as_str()).unwrap_or("Unknown Group").to_string();
+                        let creator = json_val.get("creator").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+                        
+                        // Check if already in this group
+                        if self.groups.iter().any(|g| g.id == group_id) {
+                            self.status = format!("Already in group '{}'", group_name);
+                        } else if let Ok(Some(stored_key)) = keystore::load_keypair() {
+                            // Parse existing members from invite
+                            let mut members: Vec<group_store::GroupMember> = Vec::new();
+                            if let Some(members_arr) = json_val.get("members").and_then(|v| v.as_array()) {
+                                for m in members_arr {
+                                    let member = group_store::GroupMember {
+                                        fingerprint: m.get("fingerprint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        username: m.get("username").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
+                                        public_key: m.get("public_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        address: m.get("address").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:62780").to_string(),
+                                        joined_at: chrono::Utc::now().to_rfc3339(),
+                                    };
+                                    members.push(member);
+                                }
+                            }
+                            
+                            // Add self if not already in members
+                            let my_fp = stored_key.fingerprint.clone();
+                            if !members.iter().any(|m| m.fingerprint == my_fp) {
+                                let me = group_store::GroupMember {
+                                    fingerprint: my_fp,
+                                    username: self.my_username.clone(),
+                                    public_key: stored_key.public_key_armored.clone(),
+                                    address: format!("127.0.0.1:{}", self.listening_port.unwrap_or(62780)),
+                                    joined_at: chrono::Utc::now().to_rfc3339(),
+                                };
+                                members.push(me);
+                            }
+                            
+                            let member_count = members.len();
+                            let group = group_store::Group {
+                                id: group_id,
+                                name: group_name.clone(),
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                                creator_fingerprint: creator.clone(),
+                                members,
+                                admins: vec![creator],
+                                settings: group_store::GroupSettings {
+                                    invite_permission: group_store::InvitePermission::AdminsOnly,
+                                    max_members: None,
+                                    disappearing_timer_secs: None,
+                                },
+                                symmetric_key: vec![0u8; 32], // Placeholder - real key comes from network
+                            };
+                            
+                            // Save to storage
+                            let mut groups = group_store::load_groups(&stored_key.fingerprint).unwrap_or_default();
+                            groups.push(group.clone());
+                            if let Err(e) = group_store::save_groups(&groups, &stored_key.fingerprint) {
+                                self.status = format!("Failed to save group: {}", e);
+                            } else {
+                                // Broadcast join announcement to all OTHER members
+                                let my_member_info = group.members.iter()
+                                    .find(|m| m.fingerprint == stored_key.fingerprint)
+                                    .cloned();
+                                
+                                if let Some(me) = my_member_info {
+                                    let other_members: Vec<String> = group.members.iter()
+                                        .filter(|m| m.fingerprint != stored_key.fingerprint)
+                                        .map(|m| m.address.clone())
+                                        .collect();
+                                    
+                                    if !other_members.is_empty() {
+                                        let announcement = network::MessageEnvelope::GroupJoinAnnouncement {
+                                            group_id: group.id.clone(),
+                                            new_member: me,
+                                        };
+                                        let (sent, _) = network::NetworkHandle::send_to_group(&other_members, announcement);
+                                        self.status = format!("Joined '{}' - syncing with {} members", group_name, sent);
+                                    } else {
+                                        self.status = format!("Joined '{}'", group_name);
+                                    }
+                                }
+                                
+                                // Auto-select the group so chat is immediately enabled
+                                self.selected_group_id = Some(group.id.clone());
+                                self.groups.push(group);
+                                self.group_invite_input.clear();
+                            }
+                        }
+                    } else {
+                        self.status = "Invalid invite: not a group invite".to_string();
+                    }
+                } else {
+                    self.status = "Invalid JSON in invite".to_string();
+                }
+                Command::none()
+            }
+            Message::PasswordInputChanged(password) => {
+                self.password_input = password;
+                self.login_error = None; // Clear error on input
+                Command::none()
+            }
+            Message::ConfirmPasswordChanged(password) => {
+                self.confirm_password_input = password;
+                self.login_error = None;
+                Command::none()
+            }
+            Message::Login => {
+                let password = self.password_input.clone();
+                match account_store::login(&password) {
+                    Ok((account, secret_key)) => {
+                        // Load keypair from decrypted secret key
+                        match cryptochat_crypto_core::pgp::PgpKeyPair::from_secret_key(&secret_key) {
+                            Ok(keypair) => {
+                                self.app_state.set_keypair(keypair);
+                                self.my_username = account.username.clone();
+                                self.password_input.clear();
+                                self.view = View::Chat;
+                                self.status = format!("Welcome back, {}!", account.username);
+                                // Load groups
+                                self.groups = group_store::load_groups(&account.fingerprint).unwrap_or_default();
+                                return Command::perform(async { start_network_async().await }, Message::NetworkStarted);
+                            }
+                            Err(e) => {
+                                self.login_error = Some(format!("Key error: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.login_error = Some(format!("{}", e));
+                    }
+                }
+                Command::none()
+            }
+            Message::CreateAccount => {
+                if self.password_input != self.confirm_password_input {
+                    self.login_error = Some("Passwords don't match".to_string());
+                    return Command::none();
+                }
+                if self.password_input.len() < 4 {
+                    self.login_error = Some("Password must be at least 4 characters".to_string());
+                    return Command::none();
+                }
+                
+                self.generating_keys = true;
+                self.status = "Creating account...".to_string();
+                let password = self.password_input.clone();
+                let username = self.my_username.clone();
+                
+                // Check if keypair is already loaded (legacy migration)
+                let existing_keypair = self.app_state.get_keypair_for_export();
+                
+                Command::perform(
+                    async move {
+                        let (secret_key, public_key, fingerprint) = if let Some((sk, pk, fp)) = existing_keypair {
+                            // Use existing keys from legacy keystore
+                            (sk, pk, fp)
+                        } else {
+                            // Generate new keypair
+                            let keypair = cryptochat_crypto_core::pgp::PgpKeyPair::generate("CryptoChat User")
+                                .map_err(|e| format!("{}", e))?;
+                            let sk = keypair.export_secret_key().map_err(|e| format!("{}", e))?;
+                            let pk = keypair.export_public_key().map_err(|e| format!("{}", e))?;
+                            let fp = keypair.fingerprint();
+                            (sk, pk, fp)
+                        };
+                        
+                        // Create account with encrypted key
+                        account_store::create_account(&username, &password, &secret_key, &public_key, &fingerprint)
+                            .map_err(|e| format!("{}", e))?;
+                        
+                        // Also save to keystore for backward compat
+                        let stored = keystore::StoredKey::new(secret_key, public_key, fingerprint);
+                        keystore::save_keypair(&stored).map_err(|e| format!("{}", e))?;
+                        
+                        Ok(())
+                    },
+                    Message::LoginResult,
+                )
+            }
+            Message::LoginResult(result) => {
+                self.generating_keys = false;
+                match result {
+                    Ok(()) => {
+                        // Account created, now login
+                        self.login_error = None;
+                        self.confirm_password_input.clear();
+                        self.status = "Account created! Logging in...".to_string();
+                        // Trigger login
+                        return self.update(Message::Login);
+                    }
+                    Err(e) => {
+                        self.login_error = Some(e);
+                    }
+                }
+                Command::none()
+            }
         }
     }
 
     fn view(&self) -> Element<Message> {
         let content: Element<Message> = match self.view {
+            View::Login => self.view_login(),
             View::Onboarding => self.view_onboarding(),
             View::Chat => self.view_chat(),
         };
@@ -1047,11 +1538,22 @@ async fn scan_qr_from_clipboard_async(app_state: Arc<app::AppState>) -> Result<I
     }).await.map_err(|e| format!("{}", e))?
 }
 
-// Chat history helpers
+// Chat history helpers - uses encrypted storage when fingerprint available
 fn load_chat_history_sync() -> Vec<ChatMessage> {
-    request_store::load_chat_history()
-        .unwrap_or_default()
-        .into_iter()
+    // Try to get fingerprint for encrypted storage
+    let fingerprint = keystore::load_keypair()
+        .ok()
+        .flatten()
+        .map(|k| k.fingerprint.clone());
+    
+    let stored_messages = if let Some(ref fp) = fingerprint {
+        request_store::load_chat_history_encrypted(fp).unwrap_or_default()
+    } else {
+        // Fallback to old unencrypted format if no keys yet
+        request_store::load_chat_history().unwrap_or_default()
+    };
+    
+    stored_messages.into_iter()
         .map(|m| ChatMessage {
             sender_name: m.sender_name,
             content: m.content,
@@ -1069,8 +1571,15 @@ fn save_message_to_history(msg: &ChatMessage) {
         content: msg.content.clone(),
         is_mine: msg.is_mine,
         timestamp: msg.timestamp.clone(),
+        expires_at: None, // TODO: Add disappearing timer support
     };
-    let _ = request_store::append_message(&stored);
+    
+    // Try to get fingerprint for encrypted storage
+    if let Ok(Some(key)) = keystore::load_keypair() {
+        let _ = request_store::append_message_encrypted(&stored, &key.fingerprint);
+    } else {
+        let _ = request_store::append_message(&stored);
+    }
 }
 
 async fn start_network_async() -> Result<u16, String> {
@@ -1094,6 +1603,16 @@ async fn generate_keys_async() -> Result<KeyGenResult, String> {
 
 async fn import_key_share_async(app_state: Arc<app::AppState>, input: String) -> Result<ImportResult, String> {
     tokio::task::spawn_blocking(move || {
+        // First, check if this is a group invite (has "type": "group_invite")
+        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&input) {
+            if json_val.get("type").and_then(|t| t.as_str()) == Some("group_invite") {
+                // This is a group invite - return helpful error
+                let group_name = json_val.get("group_name").and_then(|n| n.as_str()).unwrap_or("Unknown");
+                return Err(format!("This is a group invite for '{}'. Group invites will be sent over the network once connected. For now, share personal keys first, then receive invites.", group_name));
+            }
+        }
+        
+        // Standard key share import
         let key_share: network::KeyShareData = serde_json::from_str(&input).map_err(|e| format!("Invalid JSON: {}", e))?;
         let keypair = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&key_share.public_key).map_err(|e| format!("Invalid key: {}", e))?;
         let fingerprint = keypair.fingerprint();
@@ -1112,6 +1631,80 @@ async fn send_message_async(app_state: Arc<app::AppState>, peer_address: String,
 }
 
 impl CryptoChat {
+    fn view_login(&self) -> Element<Message> {
+        let has_account = account_store::account_exists();
+        
+        let title = text(if has_account { "Welcome Back" } else { "Create Account" }).size(24);
+        let subtitle = text(if has_account { "Enter your password to unlock" } else { "Set a password to protect your keys" }).size(12);
+        
+        let username_input = column![
+            text("Username:").size(11),
+            text_input("Your name", &self.my_username)
+                .on_input(Message::UsernameChanged)
+                .padding(8).size(14),
+        ].spacing(4);
+        
+        let password_input = column![
+            text("Password:").size(11),
+            text_input("Password", &self.password_input)
+                .on_input(Message::PasswordInputChanged)
+                .padding(8).size(14),
+        ].spacing(4);
+        
+        let confirm_input: Element<Message> = if !has_account {
+            column![
+                text("Confirm Password:").size(11),
+                text_input("Confirm password", &self.confirm_password_input)
+                    .on_input(Message::ConfirmPasswordChanged)
+                    .padding(8).size(14),
+            ].spacing(4).into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
+        let error_text: Element<Message> = if let Some(ref error) = self.login_error {
+            text(error).size(11).style(iced::theme::Text::Color(Color::from_rgb(1.0, 0.3, 0.3))).into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
+        let action_btn = if has_account {
+            button(text("Login").size(14)).padding([10, 30]).on_press(Message::Login)
+        } else {
+            if self.generating_keys {
+                button(text("Creating...").size(14)).padding([10, 30])
+            } else {
+                button(text("Create Account").size(14)).padding([10, 30]).on_press(Message::CreateAccount)
+            }
+        };
+        
+        let content = column![
+            Space::with_height(60),
+            text("🔐").size(48),
+            title,
+            subtitle,
+            Space::with_height(20),
+            username_input,
+            password_input,
+            confirm_input,
+            error_text,
+            Space::with_height(10),
+            action_btn,
+            Space::with_height(20),
+            text(&self.status).size(10),
+        ]
+        .width(300)
+        .spacing(8)
+        .align_items(iced::Alignment::Center);
+        
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .center_y()
+            .into()
+    }
+
     fn view_onboarding(&self) -> Element<Message> {
         let generate_btn = if self.generating_keys {
             button(text("Generating...").size(18)).padding([12, 24])
@@ -1220,6 +1813,87 @@ impl CryptoChat {
                 pending_section,
                 text("Contacts:").size(10),
                 contacts_section,
+                Space::with_height(12),
+                row![
+                    text("Groups:").size(10),
+                    button(text("+").size(10)).padding([2, 6]).on_press(Message::CreateGroup),
+                ].spacing(4).align_items(iced::Alignment::Center),
+                {
+                    let groups_list: Element<Message> = if let Some(ref pending_id) = self.pending_group_delete {
+                        // Show confirmation dialog
+                        let group_name = self.groups.iter()
+                            .find(|g| &g.id == pending_id)
+                            .map(|g| g.name.as_str())
+                            .unwrap_or("Unknown");
+                        column![
+                            text(format!("Delete '{}'?", group_name)).size(10),
+                            row![
+                                button(text("Yes").size(9)).padding([3, 8]).on_press(Message::ConfirmDeleteGroup(pending_id.clone())),
+                                button(text("No").size(9)).padding([3, 8]).on_press(Message::CancelDeleteGroup),
+                            ].spacing(4),
+                        ].spacing(4).into()
+                    } else if self.groups.is_empty() {
+                        text("No groups yet").size(9).into()
+                    } else {
+                        column(
+                            self.groups.iter().map(|g| {
+                                row![
+                                    button(text(&g.name).size(10))
+                                        .padding([4, 8])
+                                        .on_press(Message::SelectGroup(g.id.clone())),
+                                    button(text("📋").size(9))
+                                        .padding([3, 5])
+                                        .on_press(Message::CopyGroupKey(g.id.clone())),
+                                    button(text("X").size(9))
+                                        .padding([3, 5])
+                                        .on_press(Message::RequestDeleteGroup(g.id.clone())),
+                                ].spacing(2).into()
+                            }).collect::<Vec<Element<Message>>>()
+                        ).spacing(2).into()
+                    };
+                    groups_list
+                },
+                Space::with_height(8),
+                {
+                    // Join Group section with input and preview
+                    let join_section: Element<Message> = if self.group_invite_input.is_empty() {
+                        column![
+                            text("Join Group:").size(9),
+                            text_input("Paste invite...", &self.group_invite_input)
+                                .on_input(Message::GroupInviteInputChanged)
+                                .padding(4).size(9),
+                        ].spacing(2).into()
+                    } else {
+                        // Try to parse and show preview
+                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&self.group_invite_input) {
+                            if json_val.get("type").and_then(|t| t.as_str()) == Some("group_invite") {
+                                let name = json_val.get("group_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let creator = json_val.get("creator").and_then(|v| v.as_str()).unwrap_or("?");
+                                let members = json_val.get("members").and_then(|v| v.as_i64()).unwrap_or(1);
+                                column![
+                                    text(format!("📌 {}", name)).size(10),
+                                    text(format!("By: {} • {} members", creator, members)).size(8),
+                                    row![
+                                        button(text("Join").size(9)).padding([3, 8]).on_press(Message::JoinGroup),
+                                        button(text("✕").size(9)).padding([3, 6]).on_press(Message::GroupInviteInputChanged(String::new())),
+                                    ].spacing(4),
+                                ].spacing(3).into()
+                            } else {
+                                column![
+                                    text("❌ Not a group invite").size(9),
+                                    button(text("Clear").size(8)).padding([2, 6]).on_press(Message::GroupInviteInputChanged(String::new())),
+                                ].spacing(2).into()
+                            }
+                        } else {
+                            column![
+                                text_input("Paste invite...", &self.group_invite_input)
+                                    .on_input(Message::GroupInviteInputChanged)
+                                    .padding(4).size(9),
+                            ].into()
+                        }
+                    };
+                    join_section
+                },
                 Space::with_height(Length::Fill),
                 row![theme_btn, clear_btn].spacing(4),
             ].padding(10).spacing(2)
@@ -1254,7 +1928,8 @@ impl CryptoChat {
         };
         
         // Input area with action bar
-        let can_send = self.recipient_key_imported;
+        // Can send if: 1) have 1-on-1 connection OR 2) have a group selected
+        let can_send = self.recipient_key_imported || self.selected_group_id.is_some();
         let input_area = if can_send {
             // Action bar with buttons
             let action_bar = row![

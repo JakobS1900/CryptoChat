@@ -37,6 +37,40 @@ pub enum NetworkEvent {
     ContactRemovalReceived {
         fingerprint: String,
     },
+    
+    // Group Events
+    GroupInviteReceived {
+        group_id: String,
+        group_name: String,
+        creator_name: String,
+        encrypted_symmetric_key: String,
+        members: Vec<(String, String)>,
+        settings: crate::group_store::GroupSettings,
+    },
+    
+    GroupMessageReceived {
+        group_id: String,
+        sender_fingerprint: String,
+        sender_name: String,
+        encrypted_content: String,
+        timestamp: String,
+        expires_at: Option<String>,
+    },
+    
+    /// A new member announced they joined a group
+    GroupJoinReceived {
+        group_id: String,
+        new_member: crate::group_store::GroupMember,
+        /// Address to send sync response back to
+        sender_address: String,
+    },
+    
+    /// Received member list from another member (in response to our join)
+    GroupMemberSyncReceived {
+        group_id: String,
+        members: Vec<crate::group_store::GroupMember>,
+    },
+    
     Error(String),
 }
 
@@ -80,6 +114,77 @@ pub enum MessageEnvelope {
     ContactRemoved {
         /// Fingerprint of the contact being removed
         fingerprint: String,
+    },
+    
+    // Group Chat Messages
+    
+    GroupInvite {
+        group_id: String,
+        group_name: String,
+        creator_name: String,
+        /// AES key encrypted with recipient's public key
+        encrypted_symmetric_key: String,
+        members: Vec<(String, String)>, // (name, fingerprint)
+        settings: crate::group_store::GroupSettings,
+    },
+    
+    GroupInviteResponse {
+        group_id: String,
+        accepted: bool,
+        responder_name: String,
+        responder_fingerprint: String,
+        responder_public_key: String,
+        responder_address: String,
+    },
+    
+    GroupMessage {
+        group_id: String,
+        sender_fingerprint: String,
+        sender_name: String,
+        /// AES-encrypted message content
+        encrypted_content: String,
+        timestamp: String,
+        /// Optional expiration for disappearing messages
+        expires_at: Option<String>,
+    },
+    
+    MemberAdded {
+        group_id: String,
+        member: crate::group_store::GroupMember,
+        // Encrypted key for the new member (only sent to the new member)
+        // OR if sent to existing members, this field might be empty or reused
+        // Usually this message is broadcast to EXISTING members to update their list.
+        // The new member gets a GroupInvite (or similar 'GroupSync')
+    },
+    
+    MemberRemoved {
+        group_id: String,
+        removed_fingerprint: String,
+        /// New symmetric key (encrypted for the recipient)
+        new_encrypted_key: Option<String>, 
+    },
+    
+    AdminPromoted {
+        group_id: String,
+        promoted_fingerprint: String,
+    },
+    
+    SettingsChanged {
+        group_id: String,
+        new_settings: crate::group_store::GroupSettings,
+    },
+    
+    /// Sent by a new joiner to all existing members to announce they joined
+    GroupJoinAnnouncement {
+        group_id: String,
+        new_member: crate::group_store::GroupMember,
+    },
+    
+    /// Response to join announcement - contains sender's current member list
+    GroupMemberSync {
+        group_id: String,
+        /// Full member list from sender's perspective
+        members: Vec<crate::group_store::GroupMember>,
     },
 }
 
@@ -142,6 +247,22 @@ impl NetworkHandle {
         Ok(())
     }
 
+    /// Send a message to all members of a group
+    /// Returns the number of successful sends and any failures
+    pub fn send_to_group(member_addresses: &[String], envelope: MessageEnvelope) -> (usize, Vec<String>) {
+        let mut success_count = 0;
+        let mut failures = Vec::new();
+        
+        for address in member_addresses {
+            match Self::send_message(address, envelope.clone()) {
+                Ok(_) => success_count += 1,
+                Err(e) => failures.push(format!("{}: {}", address, e)),
+            }
+        }
+        
+        (success_count, failures)
+    }
+
     pub fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
 }
 
@@ -187,6 +308,49 @@ fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<Netw
         MessageEnvelope::ContactRemoved { fingerprint } => {
             let _ = sender.send(NetworkEvent::ContactRemovalReceived { fingerprint });
         }
+
+        // Group Messages
+        MessageEnvelope::GroupInvite { group_id, group_name, creator_name, encrypted_symmetric_key, members, settings } => {
+            let _ = sender.send(NetworkEvent::GroupInviteReceived {
+                group_id,
+                group_name,
+                creator_name,
+                encrypted_symmetric_key,
+                members,
+                settings,
+            });
+        }
+        
+        MessageEnvelope::GroupMessage { group_id, sender_fingerprint, sender_name, encrypted_content, timestamp, expires_at } => {
+            let _ = sender.send(NetworkEvent::GroupMessageReceived {
+                group_id,
+                sender_fingerprint,
+                sender_name,
+                encrypted_content,
+                timestamp,
+                expires_at,
+            });
+        }
+        
+        MessageEnvelope::GroupJoinAnnouncement { group_id, new_member } => {
+            let ip = peer_addr.split(':').next().unwrap_or("127.0.0.1");
+            // Use member's address from the message, or construct from peer IP
+            let sender_address = new_member.address.clone();
+            let _ = sender.send(NetworkEvent::GroupJoinReceived {
+                group_id,
+                new_member,
+                sender_address,
+            });
+        }
+        
+        MessageEnvelope::GroupMemberSync { group_id, members } => {
+            let _ = sender.send(NetworkEvent::GroupMemberSyncReceived {
+                group_id,
+                members,
+            });
+        }
+        
+        _ => {}
     }
     Ok(())
 }

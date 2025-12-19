@@ -2,6 +2,7 @@
 
 mod account_store;
 mod app;
+mod color_store;
 mod encrypted_storage;
 mod group_store;
 mod keystore;
@@ -88,6 +89,20 @@ pub struct CryptoChat {
     confirm_password_input: String,
     /// Login error message
     login_error: Option<String>,
+    
+    // Color settings
+    /// Show settings modal
+    show_settings: bool,
+    /// Settings tab (0=Solid, 1=Gradient, 2=Rainbow)
+    settings_tab: u8,
+    /// Color preferences
+    color_prefs: color_store::ColorPreferences,
+    /// Rainbow animation offset (0.0 - 1.0)
+    rainbow_offset: f32,
+    /// Gradient color 1 (for editing)
+    gradient_color1: String,
+    /// Gradient color 2 (for editing)
+    gradient_color2: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +200,26 @@ pub enum Message {
     CreateAccount,
     /// Login result
     LoginResult(Result<(), String>),
+    
+    // Settings/Color customization
+    /// Toggle settings modal
+    ToggleSettings,
+    /// Switch settings tab (0=Solid, 1=Gradient, 2=Rainbow)
+    SetSettingsTab(u8),
+    /// Hue slider changed (0-360)
+    SetHue(f32),
+    /// Saturation slider changed (0-1)
+    SetSaturation(f32),
+    /// Set gradient color 1
+    SetGradientColor1(String),
+    /// Set gradient color 2
+    SetGradientColor2(String),
+    /// Set rainbow speed
+    SetRainbowSpeed(f32),
+    /// Save color preferences
+    SaveColorPrefs,
+    /// Tick for rainbow animation
+    RainbowTick,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +303,27 @@ impl Application for CryptoChat {
                 password_input: String::new(),
                 confirm_password_input: String::new(),
                 login_error: None,
+                
+                // Color settings - load from disk and apply to theme
+                show_settings: false,
+                settings_tab: 0,
+                color_prefs: {
+                    let prefs = color_store::load_preferences();
+                    // Set initial bubble color in theme
+                    if let color_store::BubbleStyle::Solid { ref color } = prefs.bubble_style {
+                        if let Some((r, g, b)) = color_store::hex_to_rgb(color) {
+                            theme::set_bubble_color(r, g, b);
+                        }
+                    } else if let color_store::BubbleStyle::Gradient { ref color1, .. } = prefs.bubble_style {
+                        if let Some((r, g, b)) = color_store::hex_to_rgb(color1) {
+                            theme::set_bubble_color(r, g, b);
+                        }
+                    }
+                    prefs
+                },
+                rainbow_offset: 0.0,
+                gradient_color1: "#ff0000".to_string(),
+                gradient_color2: "#0000ff".to_string(),
             },
             init_command,
         )
@@ -1322,6 +1378,103 @@ impl Application for CryptoChat {
                 }
                 Command::none()
             }
+            
+            // Color settings handlers
+            Message::ToggleSettings => {
+                self.show_settings = !self.show_settings;
+                Command::none()
+            }
+            Message::SetSettingsTab(tab) => {
+                self.settings_tab = tab;
+                // Update bubble style based on tab
+                match tab {
+                    0 => {
+                        // Solid - update from hue/saturation
+                        let color = color_store::hsl_to_hex(self.color_prefs.hue, self.color_prefs.saturation, 0.5);
+                        self.color_prefs.bubble_style = color_store::BubbleStyle::Solid { color };
+                    }
+                    1 => {
+                        // Gradient
+                        self.color_prefs.bubble_style = color_store::BubbleStyle::Gradient {
+                            color1: self.gradient_color1.clone(),
+                            color2: self.gradient_color2.clone(),
+                        };
+                    }
+                    2 => {
+                        // Rainbow
+                        self.color_prefs.bubble_style = color_store::BubbleStyle::Rainbow { speed: 1.0 };
+                    }
+                    _ => {}
+                }
+                Command::none()
+            }
+            Message::SetHue(hue) => {
+                self.color_prefs.hue = hue;
+                let color = color_store::hsl_to_hex(hue, self.color_prefs.saturation, 0.5);
+                self.color_prefs.bubble_style = color_store::BubbleStyle::Solid { color };
+                Command::none()
+            }
+            Message::SetSaturation(sat) => {
+                self.color_prefs.saturation = sat;
+                let color = color_store::hsl_to_hex(self.color_prefs.hue, sat, 0.5);
+                self.color_prefs.bubble_style = color_store::BubbleStyle::Solid { color };
+                Command::none()
+            }
+            Message::SetGradientColor1(color) => {
+                self.gradient_color1 = color.clone();
+                self.color_prefs.bubble_style = color_store::BubbleStyle::Gradient {
+                    color1: color,
+                    color2: self.gradient_color2.clone(),
+                };
+                Command::none()
+            }
+            Message::SetGradientColor2(color) => {
+                self.gradient_color2 = color.clone();
+                self.color_prefs.bubble_style = color_store::BubbleStyle::Gradient {
+                    color1: self.gradient_color1.clone(),
+                    color2: color,
+                };
+                Command::none()
+            }
+            Message::SetRainbowSpeed(speed) => {
+                self.color_prefs.bubble_style = color_store::BubbleStyle::Rainbow { speed };
+                Command::none()
+            }
+            Message::SaveColorPrefs => {
+                // Apply the color to theme immediately
+                match &self.color_prefs.bubble_style {
+                    color_store::BubbleStyle::Solid { color } => {
+                        if let Some((r, g, b)) = color_store::hex_to_rgb(color) {
+                            theme::set_bubble_color(r, g, b);
+                        }
+                    }
+                    color_store::BubbleStyle::Gradient { color1, .. } => {
+                        if let Some((r, g, b)) = color_store::hex_to_rgb(color1) {
+                            theme::set_bubble_color(r, g, b);
+                        }
+                    }
+                    color_store::BubbleStyle::Rainbow { .. } => {
+                        // Rainbow updates dynamically
+                    }
+                }
+                let _ = color_store::save_preferences(&self.color_prefs);
+                self.show_settings = false;
+                self.status = "Color preferences saved!".to_string();
+                Command::none()
+            }
+            Message::RainbowTick => {
+                // Update rainbow offset for animation
+                if let color_store::BubbleStyle::Rainbow { speed } = &self.color_prefs.bubble_style {
+                    self.rainbow_offset = (self.rainbow_offset + 0.01 * speed) % 1.0;
+                    // Update bubble color with rainbow hue
+                    let hue = self.rainbow_offset * 360.0;
+                    let color = color_store::hsl_to_hex(hue, 0.8, 0.5);
+                    if let Some((r, g, b)) = color_store::hex_to_rgb(&color) {
+                        theme::set_bubble_color(r, g, b);
+                    }
+                }
+                Command::none()
+            }
         }
     }
 
@@ -1335,7 +1488,17 @@ impl Application for CryptoChat {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::PollNetwork)
+        // Network polling
+        let network_sub = iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::PollNetwork);
+        
+        // Rainbow animation tick (when rainbow mode is active)
+        if let color_store::BubbleStyle::Rainbow { speed } = &self.color_prefs.bubble_style {
+            let interval = (100.0 / speed) as u64;
+            let rainbow_sub = iced::time::every(std::time::Duration::from_millis(interval)).map(|_| Message::RainbowTick);
+            Subscription::batch([network_sub, rainbow_sub])
+        } else {
+            network_sub
+        }
     }
 
     fn theme(&self) -> Theme {
@@ -1757,6 +1920,7 @@ impl CryptoChat {
         let clear_btn = button(text("Clear History").size(10)).padding([4, 8]).on_press(Message::ClearHistory);
         let theme_label = if self.dark_mode { "Light Mode" } else { "Dark Mode" };
         let theme_btn = button(text(theme_label).size(10)).padding([4, 8]).on_press(Message::ToggleTheme);
+        let settings_btn = button(text("⚙ Colors").size(10)).padding([4, 8]).on_press(Message::ToggleSettings);
         
         // Pending connection requests with Accept/Decline
         let pending_section: Element<Message> = if self.pending_requests.is_empty() {
@@ -1895,7 +2059,7 @@ impl CryptoChat {
                     join_section
                 },
                 Space::with_height(Length::Fill),
-                row![theme_btn, clear_btn].spacing(4),
+                row![theme_btn, settings_btn, clear_btn].spacing(4),
             ].padding(10).spacing(2)
         ).width(260).height(Length::Fill);
         
@@ -2023,7 +2187,110 @@ impl CryptoChat {
             input_area,
         ].width(Length::Fill).height(Length::Fill);
         
-        row![sidebar, chat_area].width(Length::Fill).height(Length::Fill).into()
+        // Settings modal overlay
+        let settings_modal: Element<Message> = if self.show_settings {
+            let tab_buttons = row![
+                button(text("Solid").size(12))
+                    .padding([6, 12])
+                    .on_press(Message::SetSettingsTab(0)),
+                button(text("Gradient").size(12))
+                    .padding([6, 12])
+                    .on_press(Message::SetSettingsTab(1)),
+                button(text("Rainbow").size(12))
+                    .padding([6, 12])
+                    .on_press(Message::SetSettingsTab(2)),
+            ].spacing(4);
+            
+            // Preview: show color as text instead of styled container
+            let preview_text = match &self.color_prefs.bubble_style {
+                color_store::BubbleStyle::Solid { color } => format!("Preview: {}", color),
+                color_store::BubbleStyle::Gradient { color1, color2 } => format!("Gradient: {} → {}", color1, color2),
+                color_store::BubbleStyle::Rainbow { speed } => format!("🌈 Rainbow (speed: {:.1}x)", speed),
+            };
+            
+            // Tab content based on selected tab
+            let tab_content: Element<Message> = match self.settings_tab {
+                0 => {
+                    // Solid color: Hue presets
+                    column![
+                        text("Hue").size(11),
+                        text(format!("Current: {:.0}°", self.color_prefs.hue)).size(10),
+                        text("Select a preset:").size(10),
+                        row![
+                            button(text("🔵 Blue").size(12).font(EMOJI_FONT)).padding(4).on_press(Message::SetHue(210.0)),
+                            button(text("🟢 Green").size(12).font(EMOJI_FONT)).padding(4).on_press(Message::SetHue(120.0)),
+                            button(text("🟣 Purple").size(12).font(EMOJI_FONT)).padding(4).on_press(Message::SetHue(280.0)),
+                        ].spacing(4),
+                        row![
+                            button(text("🟠 Orange").size(12).font(EMOJI_FONT)).padding(4).on_press(Message::SetHue(30.0)),
+                            button(text("🔴 Red").size(12).font(EMOJI_FONT)).padding(4).on_press(Message::SetHue(0.0)),
+                            button(text("🩷 Pink").size(12).font(EMOJI_FONT)).padding(4).on_press(Message::SetHue(330.0)),
+                        ].spacing(4),
+                    ].spacing(8).into()
+                }
+                1 => {
+                    // Gradient: two color pickers
+                    column![
+                        text("Color 1 (start):").size(11),
+                        row![
+                            button(text("🔴").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor1("#ff0000".to_string())),
+                            button(text("🟠").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor1("#ff9500".to_string())),
+                            button(text("🟢").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor1("#32b432".to_string())),
+                            button(text("🔵").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor1("#0a84ff".to_string())),
+                            button(text("🟣").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor1("#9b59b6".to_string())),
+                        ].spacing(4),
+                        text("Color 2 (end):").size(11),
+                        row![
+                            button(text("🔴").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor2("#ff0000".to_string())),
+                            button(text("🟠").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor2("#ff9500".to_string())),
+                            button(text("🟢").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor2("#32b432".to_string())),
+                            button(text("🔵").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor2("#0a84ff".to_string())),
+                            button(text("🟣").font(EMOJI_FONT)).padding(4).on_press(Message::SetGradientColor2("#9b59b6".to_string())),
+                        ].spacing(4),
+                    ].spacing(8).into()
+                }
+                _ => {
+                    // Rainbow: speed control
+                    column![
+                        text("🌈 Rainbow Mode").size(14).font(EMOJI_FONT),
+                        text("Bubbles cycle through colors!").size(11),
+                        row![
+                            button(text("Slow")).padding([4, 8]).on_press(Message::SetRainbowSpeed(0.5)),
+                            button(text("Medium")).padding([4, 8]).on_press(Message::SetRainbowSpeed(1.0)),
+                            button(text("Fast")).padding([4, 8]).on_press(Message::SetRainbowSpeed(2.0)),
+                        ].spacing(4),
+                    ].spacing(8).into()
+                }
+            };
+            
+            let modal = column![
+                row![
+                    text("Color Settings").size(16),
+                    Space::with_width(Length::Fill),
+                    button(text("✕").size(14)).padding(4).on_press(Message::ToggleSettings),
+                ],
+                tab_buttons,
+                text(&preview_text).size(12),
+                tab_content,
+                row![
+                    button(text("Cancel")).padding([6, 16]).on_press(Message::ToggleSettings),
+                    Space::with_width(Length::Fill),
+                    button(text("Save")).padding([6, 16]).on_press(Message::SaveColorPrefs),
+                ],
+            ].spacing(12).padding(16);
+            
+            container(modal).width(Length::Fill).height(Length::Fill).center_x().center_y().into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
+        // If settings modal is open, show it as the main content with sidebar
+        // Otherwise show normal chat
+        if self.show_settings {
+            row![sidebar, settings_modal].width(Length::Fill).height(Length::Fill).into()
+        } else {
+            row![sidebar, chat_area].width(Length::Fill).height(Length::Fill).into()
+        }
     }
     
     fn render_bubble(&self, msg: &ChatMessage, msg_index: usize) -> Element<Message> {
@@ -2078,8 +2345,10 @@ impl CryptoChat {
             ].spacing(3).into()
         };
         
+        // Build bubble appearance
+        // Uses custom color from static storage (set on load and when saving preferences)
         let bubble_style: fn(&Theme) -> container::Appearance = if msg.is_mine {
-            |_| theme::my_bubble()
+            |_| theme::my_bubble_custom()
         } else {
             |_| theme::their_bubble()
         };

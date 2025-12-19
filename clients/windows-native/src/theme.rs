@@ -90,3 +90,45 @@ pub fn their_bubble() -> iced::widget::container::Appearance {
         ..Default::default()
     }
 }
+
+/// Custom colored bubble for user's messages
+pub fn custom_bubble(r: f32, g: f32, b: f32) -> iced::widget::container::Appearance {
+    iced::widget::container::Appearance {
+        background: Some(iced::Background::Color(Color::from_rgb(r, g, b))),
+        text_color: Some(Color::WHITE),
+        border: iced::Border {
+            radius: 16.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// Static storage for custom bubble color (packed as RGB u32)
+static CUSTOM_BUBBLE_COLOR: AtomicU32 = AtomicU32::new(0x2c7be5); // Default blue
+
+/// Set the custom bubble color from RGB floats
+pub fn set_bubble_color(r: f32, g: f32, b: f32) {
+    let packed = ((r * 255.0) as u32) << 16 | ((g * 255.0) as u32) << 8 | (b * 255.0) as u32;
+    CUSTOM_BUBBLE_COLOR.store(packed, Ordering::Relaxed);
+}
+
+/// Get my_bubble with custom color from static storage
+pub fn my_bubble_custom() -> iced::widget::container::Appearance {
+    let packed = CUSTOM_BUBBLE_COLOR.load(Ordering::Relaxed);
+    let r = ((packed >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((packed >> 8) & 0xFF) as f32 / 255.0;
+    let b = (packed & 0xFF) as f32 / 255.0;
+    
+    iced::widget::container::Appearance {
+        background: Some(iced::Background::Color(Color::from_rgb(r, g, b))),
+        text_color: Some(Color::WHITE),
+        border: iced::Border {
+            radius: 16.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}

@@ -74,7 +74,11 @@ pub fn my_bubble() -> iced::widget::container::Appearance {
             radius: 16.0.into(),
             ..Default::default()
         },
-        ..Default::default()
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
+            offset: iced::Vector { x: 2.0, y: 2.0 },
+            blur_radius: 8.0,
+        },
     }
 }
 
@@ -87,7 +91,11 @@ pub fn their_bubble() -> iced::widget::container::Appearance {
             radius: 16.0.into(),
             ..Default::default()
         },
-        ..Default::default()
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.15),
+            offset: iced::Vector { x: 2.0, y: 2.0 },
+            blur_radius: 6.0,
+        },
     }
 }
 
@@ -108,6 +116,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 // Static storage for custom bubble color (packed as RGB u32)
 static CUSTOM_BUBBLE_COLOR: AtomicU32 = AtomicU32::new(0x2c7be5); // Default blue
+// Second color for gradient mode
+static GRADIENT_COLOR_2: AtomicU32 = AtomicU32::new(0x9b59b6); // Default purple
 
 /// Set the custom bubble color from RGB floats
 pub fn set_bubble_color(r: f32, g: f32, b: f32) {
@@ -115,7 +125,29 @@ pub fn set_bubble_color(r: f32, g: f32, b: f32) {
     CUSTOM_BUBBLE_COLOR.store(packed, Ordering::Relaxed);
 }
 
-/// Get my_bubble with custom color from static storage
+/// Set the gradient second color
+pub fn set_gradient_color2(r: f32, g: f32, b: f32) {
+    let packed = ((r * 255.0) as u32) << 16 | ((g * 255.0) as u32) << 8 | (b * 255.0) as u32;
+    GRADIENT_COLOR_2.store(packed, Ordering::Relaxed);
+}
+
+/// Calculate luminance and determine if color is light (needs dark text)
+fn is_light_color(r: f32, g: f32, b: f32) -> bool {
+    // Standard luminance formula
+    let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    luminance > 0.5
+}
+
+/// Get text color based on background luminance
+fn text_color_for_bg(r: f32, g: f32, b: f32) -> Color {
+    if is_light_color(r, g, b) {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    }
+}
+
+/// Get my_bubble with custom color from static storage (color 1)
 pub fn my_bubble_custom() -> iced::widget::container::Appearance {
     let packed = CUSTOM_BUBBLE_COLOR.load(Ordering::Relaxed);
     let r = ((packed >> 16) & 0xFF) as f32 / 255.0;
@@ -124,11 +156,37 @@ pub fn my_bubble_custom() -> iced::widget::container::Appearance {
     
     iced::widget::container::Appearance {
         background: Some(iced::Background::Color(Color::from_rgb(r, g, b))),
-        text_color: Some(Color::WHITE),
+        text_color: Some(text_color_for_bg(r, g, b)),
         border: iced::Border {
             radius: 16.0.into(),
             ..Default::default()
         },
-        ..Default::default()
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
+            offset: iced::Vector { x: 2.0, y: 2.0 },
+            blur_radius: 8.0,
+        },
+    }
+}
+
+/// Get my_bubble with gradient color 2 (for alternating messages)
+pub fn my_bubble_gradient2() -> iced::widget::container::Appearance {
+    let packed = GRADIENT_COLOR_2.load(Ordering::Relaxed);
+    let r = ((packed >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((packed >> 8) & 0xFF) as f32 / 255.0;
+    let b = (packed & 0xFF) as f32 / 255.0;
+    
+    iced::widget::container::Appearance {
+        background: Some(iced::Background::Color(Color::from_rgb(r, g, b))),
+        text_color: Some(text_color_for_bg(r, g, b)),
+        border: iced::Border {
+            radius: 16.0.into(),
+            ..Default::default()
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
+            offset: iced::Vector { x: 2.0, y: 2.0 },
+            blur_radius: 8.0,
+        },
     }
 }

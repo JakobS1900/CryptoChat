@@ -65,6 +65,8 @@ pub struct CryptoChat {
     unread_count: usize,
     /// Whether peer is currently typing
     peer_is_typing: bool,
+    /// Animation phase for typing dots (0, 1, 2 for ".", "..", "...")
+    typing_dots_phase: u8,
     /// Last read timestamp from peer (for ✓✓)
     peer_last_read: Option<String>,
     /// Show emoji picker panel
@@ -220,6 +222,8 @@ pub enum Message {
     SaveColorPrefs,
     /// Tick for rainbow animation
     RainbowTick,
+    /// Tick for typing dots animation
+    TypingDotsTick,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +295,7 @@ impl Application for CryptoChat {
                 contacts: request_store::load_simple_contacts().unwrap_or_default(),
                 unread_count: 0,
                 peer_is_typing: false,
+                typing_dots_phase: 0,
                 peer_last_read: None,
                 show_emoji_picker: false,
                 emoji_suggestions: Vec::new(),
@@ -314,9 +319,12 @@ impl Application for CryptoChat {
                         if let Some((r, g, b)) = color_store::hex_to_rgb(color) {
                             theme::set_bubble_color(r, g, b);
                         }
-                    } else if let color_store::BubbleStyle::Gradient { ref color1, .. } = prefs.bubble_style {
+                    } else if let color_store::BubbleStyle::Gradient { ref color1, ref color2 } = prefs.bubble_style {
                         if let Some((r, g, b)) = color_store::hex_to_rgb(color1) {
                             theme::set_bubble_color(r, g, b);
+                        }
+                        if let Some((r, g, b)) = color_store::hex_to_rgb(color2) {
+                            theme::set_gradient_color2(r, g, b);
                         }
                     }
                     prefs
@@ -1448,9 +1456,12 @@ impl Application for CryptoChat {
                             theme::set_bubble_color(r, g, b);
                         }
                     }
-                    color_store::BubbleStyle::Gradient { color1, .. } => {
+                    color_store::BubbleStyle::Gradient { color1, color2 } => {
                         if let Some((r, g, b)) = color_store::hex_to_rgb(color1) {
                             theme::set_bubble_color(r, g, b);
+                        }
+                        if let Some((r, g, b)) = color_store::hex_to_rgb(color2) {
+                            theme::set_gradient_color2(r, g, b);
                         }
                     }
                     color_store::BubbleStyle::Rainbow { .. } => {
@@ -1465,7 +1476,7 @@ impl Application for CryptoChat {
             Message::RainbowTick => {
                 // Update rainbow offset for animation
                 if let color_store::BubbleStyle::Rainbow { speed } = &self.color_prefs.bubble_style {
-                    self.rainbow_offset = (self.rainbow_offset + 0.01 * speed) % 1.0;
+                    self.rainbow_offset = (self.rainbow_offset + 0.005 * speed) % 1.0;
                     // Update bubble color with rainbow hue
                     let hue = self.rainbow_offset * 360.0;
                     let color = color_store::hsl_to_hex(hue, 0.8, 0.5);
@@ -1473,6 +1484,11 @@ impl Application for CryptoChat {
                         theme::set_bubble_color(r, g, b);
                     }
                 }
+                Command::none()
+            }
+            Message::TypingDotsTick => {
+                // Cycle typing dots animation phase: 0 -> 1 -> 2 -> 0
+                self.typing_dots_phase = (self.typing_dots_phase + 1) % 3;
                 Command::none()
             }
         }
@@ -1491,13 +1507,28 @@ impl Application for CryptoChat {
         // Network polling
         let network_sub = iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::PollNetwork);
         
-        // Rainbow animation tick (when rainbow mode is active)
-        if let color_store::BubbleStyle::Rainbow { speed } = &self.color_prefs.bubble_style {
-            let interval = (100.0 / speed) as u64;
-            let rainbow_sub = iced::time::every(std::time::Duration::from_millis(interval)).map(|_| Message::RainbowTick);
-            Subscription::batch([network_sub, rainbow_sub])
+        // Typing dots animation (when peer is typing)
+        let typing_sub = if self.peer_is_typing {
+            Some(iced::time::every(std::time::Duration::from_millis(400)).map(|_| Message::TypingDotsTick))
         } else {
-            network_sub
+            None
+        };
+        
+        // Rainbow animation tick (when rainbow mode is active)
+        let rainbow_sub = if let color_store::BubbleStyle::Rainbow { speed } = &self.color_prefs.bubble_style {
+            // Faster ticks with smaller increments for smoother animation
+            let interval = (50.0 / speed) as u64;
+            Some(iced::time::every(std::time::Duration::from_millis(interval)).map(|_| Message::RainbowTick))
+        } else {
+            None
+        };
+        
+        // Combine all active subscriptions
+        match (typing_sub, rainbow_sub) {
+            (Some(t), Some(r)) => Subscription::batch([network_sub, t, r]),
+            (Some(t), None) => Subscription::batch([network_sub, t]),
+            (None, Some(r)) => Subscription::batch([network_sub, r]),
+            (None, None) => network_sub,
         }
     }
 
@@ -1843,9 +1874,9 @@ impl CryptoChat {
         
         let content = column![
             Space::with_height(60),
-            text("🔐").size(48),
-            title,
-            subtitle,
+            text("🔐").size(48).font(EMOJI_FONT),
+            title.font(EMOJI_FONT),
+            subtitle.font(EMOJI_FONT),
             Space::with_height(20),
             username_input,
             password_input,
@@ -1876,8 +1907,8 @@ impl CryptoChat {
         };
         column![
             Space::with_height(Length::FillPortion(1)),
-            text("CryptoChat").size(48),
-            text("Secure P2P Messaging").size(20),
+            text("CryptoChat").size(48).font(EMOJI_FONT),
+            text("Secure P2P Messaging").size(20).font(EMOJI_FONT),
             Space::with_height(40),
             generate_btn,
             Space::with_height(20),
@@ -2081,11 +2112,18 @@ impl CryptoChat {
             scrollable(column(bubbles).spacing(8).padding(16)).width(Length::Fill).height(Length::Fill).into()
         };
         
-        // Typing indicator
+        // Typing indicator with animated dots
         let typing_indicator: Element<Message> = if self.peer_is_typing {
             let name = self.peer_username.as_deref().unwrap_or("Peer");
-            container(text(format!("{} is typing...", name)).size(12))
-                .padding([4, 16])
+            // Animated dots based on phase (0=".", 1="..", 2="...")
+            let dots = match self.typing_dots_phase {
+                0 => "●  ",
+                1 => "● ●",
+                _ => "●●●",
+            };
+            let typing_text = format!("  {} {}  {}", dots, name, "is typing");
+            container(text(typing_text).size(11).style(iced::theme::Text::Color(Color::from_rgb(0.6, 0.6, 0.65))).font(EMOJI_FONT))
+                .padding([4, 8])
                 .into()
         } else {
             Space::with_height(0).into()
@@ -2347,8 +2385,14 @@ impl CryptoChat {
         
         // Build bubble appearance
         // Uses custom color from static storage (set on load and when saving preferences)
+        // For gradient mode: alternate between color1 (even) and color2 (odd)
+        let is_gradient = matches!(&self.color_prefs.bubble_style, color_store::BubbleStyle::Gradient { .. });
         let bubble_style: fn(&Theme) -> container::Appearance = if msg.is_mine {
-            |_| theme::my_bubble_custom()
+            if is_gradient && msg_index % 2 == 1 {
+                |_| theme::my_bubble_gradient2()
+            } else {
+                |_| theme::my_bubble_custom()
+            }
         } else {
             |_| theme::their_bubble()
         };

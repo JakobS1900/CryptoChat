@@ -75,6 +75,8 @@ pub struct CryptoChat {
     emoji_suggestions: Vec<(&'static str, &'static str)>,
     /// Dark mode enabled (false = light mode)
     dark_mode: bool,
+    /// Which message index has reaction picker open (None = closed)
+    reaction_picker_for_msg: Option<usize>,
     /// Pending connection requests awaiting user approval
     pending_requests: Vec<PendingRequest>,
     /// List of groups the user is in
@@ -124,6 +126,8 @@ pub struct ChatMessage {
     pub image_data: Option<Vec<u8>>,
     /// Filename for images (used for save button)
     pub image_filename: Option<String>,
+    /// Emoji reactions: (emoji, sender_name)
+    pub reactions: Vec<(String, String)>,
 }
 
 /// Pending connection request waiting for user approval
@@ -224,6 +228,14 @@ pub enum Message {
     RainbowTick,
     /// Tick for typing dots animation
     TypingDotsTick,
+    
+    // Reactions
+    /// Show reaction picker for a message (message index)
+    ShowReactionPicker(usize),
+    /// Add a reaction to a message (message index, emoji)
+    AddReaction(usize, String),
+    /// Hide reaction picker
+    HideReactionPicker,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +312,7 @@ impl Application for CryptoChat {
                 show_emoji_picker: false,
                 emoji_suggestions: Vec::new(),
                 dark_mode: true,  // Default to dark mode
+                reaction_picker_for_msg: None,
                 pending_requests: Vec::new(),
                 groups: Vec::new(), // Will be loaded when fingerprint available
                 pending_group_delete: None,
@@ -523,6 +536,7 @@ impl Application for CryptoChat {
                     timestamp: chrono_time(),
                     image_data: None,
                     image_filename: None,
+                    reactions: Vec::new(),
                 };
                 save_message_to_history(&new_msg);
                 self.chat_messages.push(new_msg);
@@ -599,6 +613,7 @@ impl Application for CryptoChat {
                                     timestamp: chrono_time(),
                                     image_data: None,
                                     image_filename: None,
+                                    reactions: Vec::new(),
                                 };
                                 save_message_to_history(&new_msg);
                                 self.chat_messages.push(new_msg);
@@ -685,6 +700,7 @@ impl Application for CryptoChat {
                                             timestamp: chrono_time(),
                                             image_data: if is_image { Some(decrypted.clone()) } else { None },
                                             image_filename: Some(filename.clone()),
+                                            reactions: Vec::new(),
                                         };
                                         
                                         // Don't save to history if it's an image (too large)
@@ -733,6 +749,7 @@ impl Application for CryptoChat {
                                 timestamp,
                                 image_data: None,
                                 image_filename: None,
+                                reactions: Vec::new(),
                             };
                             self.chat_messages.push(new_msg);
                             show_notification(&format!("{} ({})", sender_name, group.name), "New group message");
@@ -792,6 +809,13 @@ impl Application for CryptoChat {
                                     self.status = format!("Synced with group - now {} members", member_count);
                                 }
                             }
+                        }
+                    }
+                    
+                    network::NetworkEvent::ReactionReceived { msg_timestamp, emoji, sender_name } => {
+                        // Find message by timestamp and add reaction
+                        if let Some(msg) = self.chat_messages.iter_mut().find(|m| m.timestamp == msg_timestamp) {
+                            msg.reactions.push((emoji, sender_name));
                         }
                     }
                     
@@ -963,6 +987,7 @@ impl Application for CryptoChat {
                             timestamp: chrono_time(),
                             image_data: if is_image { Some(file_data) } else { None },
                             image_filename: Some(filename),
+                            reactions: Vec::new(),
                         };
                         self.chat_messages.push(new_msg);
                     }
@@ -1491,6 +1516,36 @@ impl Application for CryptoChat {
                 self.typing_dots_phase = (self.typing_dots_phase + 1) % 3;
                 Command::none()
             }
+            Message::ShowReactionPicker(msg_idx) => {
+                self.reaction_picker_for_msg = Some(msg_idx);
+                Command::none()
+            }
+            Message::HideReactionPicker => {
+                self.reaction_picker_for_msg = None;
+                Command::none()
+            }
+            Message::AddReaction(msg_idx, emoji) => {
+                // Add reaction to message and send to peer
+                if let Some(msg) = self.chat_messages.get_mut(msg_idx) {
+                    let msg_timestamp = msg.timestamp.clone();
+                    msg.reactions.push((emoji.clone(), self.my_username.clone()));
+                    
+                    // Send reaction to peer
+                    if let Some(ref addr) = self.peer_address {
+                        let envelope = network::MessageEnvelope::Reaction {
+                            msg_timestamp,
+                            emoji,
+                            sender_name: self.my_username.clone(),
+                        };
+                        let addr = addr.clone();
+                        let _ = std::thread::spawn(move || {
+                            let _ = network::NetworkHandle::send_message(&addr, envelope);
+                        });
+                    }
+                }
+                self.reaction_picker_for_msg = None;
+                Command::none()
+            }
         }
     }
 
@@ -1755,6 +1810,7 @@ fn load_chat_history_sync() -> Vec<ChatMessage> {
             timestamp: m.timestamp,
             image_data: None,  // Images not stored in history
             image_filename: None,
+            reactions: Vec::new(),
         })
         .collect()
 }
@@ -2401,19 +2457,63 @@ impl CryptoChat {
             .padding([10, 16])
             .style(bubble_style);
         
+        // Build reactions display row (if any reactions exist)
+        let reactions_display: Element<Message> = if !msg.reactions.is_empty() {
+            // Group and count reactions
+            let reaction_text: String = msg.reactions.iter()
+                .map(|(emoji, _)| emoji.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            text(reaction_text).size(16).font(EMOJI_FONT).into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
+        // Small reaction button (+)
+        let react_btn = button(text("😀").font(EMOJI_FONT).size(12))
+            .padding([2, 6])
+            .on_press(Message::ShowReactionPicker(msg_index));
+        
+        // Reaction picker (if open for this message)
+        let picker: Element<Message> = if self.reaction_picker_for_msg == Some(msg_index) {
+            let emojis = ["❤️", "👍", "😂", "😮", "😢", "🔥"];
+            let buttons: Vec<Element<Message>> = emojis.iter().map(|e| {
+                button(text(*e).font(EMOJI_FONT).size(18))
+                    .padding([4, 8])
+                    .on_press(Message::AddReaction(msg_index, e.to_string()))
+                    .into()
+            }).collect();
+            row(buttons).spacing(4).into()
+        } else {
+            Space::with_height(0).into()
+        };
+        
+        // Combine bubble + reactions + picker
+        let bubble_with_reactions = column![
+            bubble,
+            reactions_display,
+            picker,
+        ].spacing(2);
+        
         // Use row with spacers for better visual balance
         // Mine: small space | bubble | no space (right side)
         // Theirs: no space | bubble | small space (left side)
         if msg.is_mine {
             row![
                 Space::with_width(Length::FillPortion(1)), // Left spacer (takes remaining space)
-                bubble,
+                column![
+                    row![react_btn, Space::with_width(4)].align_items(iced::Alignment::End),
+                    bubble_with_reactions,
+                ].align_items(iced::Alignment::End),
             ]
             .width(Length::Fill)
             .into()
         } else {
             row![
-                bubble,
+                column![
+                    bubble_with_reactions,
+                    row![Space::with_width(4), react_btn],
+                ],
                 Space::with_width(Length::FillPortion(1)), // Right spacer
             ]
             .width(Length::Fill)

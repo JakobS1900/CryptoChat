@@ -71,6 +71,13 @@ pub enum NetworkEvent {
         members: Vec<crate::group_store::GroupMember>,
     },
     
+    /// Received reaction from peer
+    ReactionReceived {
+        msg_timestamp: String,
+        emoji: String,
+        sender_name: String,
+    },
+    
     Error(String),
 }
 
@@ -185,6 +192,16 @@ pub enum MessageEnvelope {
         group_id: String,
         /// Full member list from sender's perspective
         members: Vec<crate::group_store::GroupMember>,
+    },
+    
+    /// Emoji reaction to a message
+    Reaction {
+        /// Timestamp of the message being reacted to
+        msg_timestamp: String,
+        /// The emoji reaction
+        emoji: String,
+        /// Who sent the reaction
+        sender_name: String,
     },
 }
 
@@ -347,6 +364,14 @@ fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<Netw
             let _ = sender.send(NetworkEvent::GroupMemberSyncReceived {
                 group_id,
                 members,
+            });
+        }
+        
+        MessageEnvelope::Reaction { msg_timestamp, emoji, sender_name } => {
+            let _ = sender.send(NetworkEvent::ReactionReceived {
+                msg_timestamp,
+                emoji,
+                sender_name,
             });
         }
         

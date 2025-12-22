@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
@@ -44,6 +45,8 @@ pub struct StoredMessage {
     /// Image data if this is an image message (base64 encoded)
     pub image_data: Option<String>,
     pub image_filename: Option<String>,
+    #[serde(default)]
+    pub emotes: std::collections::HashMap<String, String>,
 }
 
 /// Derive a 256-bit storage key from the user's PGP fingerprint
@@ -61,11 +64,11 @@ pub fn derive_storage_key(fingerprint: &str) -> [u8; 32] {
     key
 }
 
-/// Encrypt chat messages for storage on disk
-pub fn encrypt_messages(messages: &[StoredMessage], storage_key: &[u8; 32]) -> Result<EncryptedStore> {
-    // Serialize messages to JSON
-    let json = serde_json::to_vec(messages)
-        .context("Failed to serialize messages")?;
+/// Encrypt generic data for storage on disk
+pub fn encrypt_data<T: Serialize + ?Sized>(data: &T, storage_key: &[u8; 32]) -> Result<EncryptedStore> {
+    // Serialize data to JSON
+    let json = serde_json::to_vec(data)
+        .context("Failed to serialize data")?;
     
     // Generate random 12-byte IV
     let mut iv_bytes = [0u8; 12];
@@ -85,8 +88,8 @@ pub fn encrypt_messages(messages: &[StoredMessage], storage_key: &[u8; 32]) -> R
     })
 }
 
-/// Decrypt chat messages from encrypted storage
-pub fn decrypt_messages(store: &EncryptedStore, storage_key: &[u8; 32]) -> Result<Vec<StoredMessage>> {
+/// Decrypt generic data from encrypted storage
+pub fn decrypt_data<T: DeserializeOwned>(store: &EncryptedStore, storage_key: &[u8; 32]) -> Result<T> {
     // Decrypt with AES-256-GCM
     let cipher = Aes256Gcm::new_from_slice(storage_key)
         .context("Failed to create cipher")?;
@@ -97,10 +100,10 @@ pub fn decrypt_messages(store: &EncryptedStore, storage_key: &[u8; 32]) -> Resul
         .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
     
     // Deserialize JSON
-    let messages: Vec<StoredMessage> = serde_json::from_slice(&plaintext)
-        .context("Failed to deserialize messages")?;
+    let data: T = serde_json::from_slice(&plaintext)
+        .context("Failed to deserialize data")?;
     
-    Ok(messages)
+    Ok(data)
 }
 
 /// Get the path to the encrypted chat history file
@@ -125,7 +128,7 @@ fn get_encrypted_history_path() -> Result<PathBuf> {
 /// Save messages to encrypted file
 pub fn save_encrypted_history(messages: &[StoredMessage], fingerprint: &str) -> Result<()> {
     let storage_key = derive_storage_key(fingerprint);
-    let encrypted = encrypt_messages(messages, &storage_key)?;
+    let encrypted = encrypt_data(messages, &storage_key)?;
     
     let path = get_encrypted_history_path()?;
     let json = serde_json::to_vec(&encrypted)?;
@@ -146,7 +149,7 @@ pub fn load_encrypted_history(fingerprint: &str) -> Result<Vec<StoredMessage>> {
     let encrypted: EncryptedStore = serde_json::from_slice(&json)?;
     
     let storage_key = derive_storage_key(fingerprint);
-    decrypt_messages(&encrypted, &storage_key)
+    decrypt_data(&encrypted, &storage_key)
 }
 
 /// Remove expired messages (for disappearing message feature)
@@ -195,6 +198,7 @@ mod tests {
                 expires_at: None,
                 image_data: None,
                 image_filename: None,
+                emotes: std::collections::HashMap::new(),
             },
         ];
         
@@ -217,6 +221,7 @@ mod tests {
                 expires_at: None,
                 image_data: None,
                 image_filename: None,
+                emotes: std::collections::HashMap::new(),
             },
         ];
         

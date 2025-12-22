@@ -233,6 +233,8 @@ pub struct StoredMessage {
     /// Optional expiration for disappearing messages (ISO8601)
     #[serde(default)]
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub emotes: std::collections::HashMap<String, String>,
 }
 
 /// Get path to chat_history.json (legacy unencrypted)
@@ -261,6 +263,7 @@ pub fn load_chat_history_encrypted(fingerprint: &str) -> Result<Vec<StoredMessag
             is_mine: m.is_mine,
             timestamp: m.timestamp,
             expires_at: m.expires_at,
+            emotes: m.emotes,
         }).collect());
     }
     
@@ -297,6 +300,7 @@ pub fn save_chat_history_encrypted(messages: &[StoredMessage], fingerprint: &str
             expires_at: m.expires_at.clone(),
             image_data: None,
             image_filename: None,
+            emotes: m.emotes.clone(),
         }
     }).collect();
     

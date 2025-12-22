@@ -41,6 +41,14 @@ impl AppState {
             .map(|kp| kp.fingerprint())
     }
 
+    pub fn get_recipient_fingerprint(&self) -> Option<String> {
+        self.recipient_keypair
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|kp| kp.fingerprint())
+    }
+
     pub fn get_keypair(&self) -> Option<PgpKeyPair> {
         self.keypair.read().unwrap().clone()
     }

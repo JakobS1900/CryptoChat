@@ -10,8 +10,13 @@ mod network;
 mod qr_exchange;
 mod request_store;
 mod theme;
+mod emote_manager;
+mod conversation;
+mod conversation_store;
 
-use iced::widget::{button, column, container, row, text, text_input, scrollable, Space};
+use conversation::{ChatMessage, Conversation};
+
+use iced::widget::{button, column, container, row, text, text_input, scrollable, Space, mouse_area};
 use iced::{Application, Command, Element, Font, Length, Settings, Subscription, Theme, Background, Border, Color};
 use std::sync::{Arc, OnceLock, Mutex};
 use tokio::sync::mpsc;
@@ -54,8 +59,14 @@ pub struct CryptoChat {
     key_share_input: String,
     recipient_key_imported: bool,
     peer_address: Option<String>,
+    
+    // UI State
+    scroll_id: scrollable::Id,
     message_input: String,
-    chat_messages: Vec<ChatMessage>,
+    // chat_messages: Vec<ChatMessage>, 
+    conversations: std::collections::HashMap<String, Conversation>,
+    active_conversation_id: Option<String>,
+    
     status: String,
     generating_keys: bool,
     listening_port: Option<u16>,
@@ -107,6 +118,9 @@ pub struct CryptoChat {
     gradient_color1: String,
     /// Gradient color 2 (for editing)
     gradient_color2: String,
+    
+    // Custom Emotes
+    emote_manager: emote_manager::EmoteManager,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,19 +130,7 @@ pub enum View {
     Chat,
 }
 
-#[derive(Debug, Clone)]
-pub struct ChatMessage {
-    pub sender_name: String,
-    pub content: String,
-    pub is_mine: bool,
-    pub timestamp: String,
-    /// Optional image data for inline preview (stored in memory)
-    pub image_data: Option<Vec<u8>>,
-    /// Filename for images (used for save button)
-    pub image_filename: Option<String>,
-    /// Emoji reactions: (emoji, sender_name)
-    pub reactions: Vec<(String, String)>,
-}
+
 
 /// Pending connection request waiting for user approval
 #[derive(Debug, Clone)]
@@ -138,6 +140,12 @@ pub struct PendingRequest {
     pub sender_address: String,
     pub sender_name: Option<String>,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EmotePayload {
+    pub content: String,
+    pub emotes: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +172,11 @@ pub enum Message {
     PickFile,
     /// Result contains (filename, raw_file_data) for successful sends
     FileSent(Result<(String, Vec<u8>), String>),
+    
+    // Emote Upload
+    UploadEmote,
+    EmoteFileSelected(Option<std::path::PathBuf>),
+    
     ToggleEmojiPicker,
     InsertEmoji(String),
     /// Select emoji from :emoji: autocomplete (name, emoji)
@@ -184,6 +197,8 @@ pub enum Message {
     CreateGroup,
     /// Select a group from the list (group_id)
     SelectGroup(String),
+    /// Select a conversation (fingerprint)
+    SelectConversation(String),
     /// Copy group invite key to clipboard
     CopyGroupKey(String),
     /// Request to delete a group (shows confirmation)
@@ -222,6 +237,8 @@ pub enum Message {
     SetGradientColor2(String),
     /// Set rainbow speed
     SetRainbowSpeed(f32),
+    /// Set "their" bubble color
+    SetTheirBubbleColor(String),
     /// Save color preferences
     SaveColorPrefs,
     /// Tick for rainbow animation
@@ -299,8 +316,14 @@ impl Application for CryptoChat {
                 key_share_input: String::new(),
                 recipient_key_imported: false,
                 peer_address: None,
+                scroll_id: scrollable::Id::unique(),
                 message_input: String::new(),
-                chat_messages: load_chat_history_sync(),
+                conversations: if let Ok(Some(key)) = keystore::load_keypair() {
+                     conversation_store::load_conversations(&key.fingerprint).unwrap_or_default()
+                } else {
+                     std::collections::HashMap::new()
+                },
+                active_conversation_id: None,
                 status: if has_keys { "Set username, then share your key".to_string() } else { "Generate keys".to_string() },
                 generating_keys: false,
                 listening_port: None,
@@ -340,15 +363,23 @@ impl Application for CryptoChat {
                             theme::set_gradient_color2(r, g, b);
                         }
                     }
+                    // Load "their" bubble color
+                    if let Some((r, g, b)) = color_store::hex_to_rgb(&prefs.their_bubble_color) {
+                        theme::set_their_bubble_color(r, g, b);
+                    }
                     prefs
                 },
                 rainbow_offset: 0.0,
                 gradient_color1: "#ff0000".to_string(),
                 gradient_color2: "#0000ff".to_string(),
+                
+                emote_manager: emote_manager::EmoteManager::new(),
             },
             init_command,
         )
     }
+    
+
 
     fn title(&self) -> String {
         let suffix = get_instance_suffix();
@@ -512,7 +543,13 @@ impl Application for CryptoChat {
                     if let Some(addr) = &self.peer_address {
                         let is_typing = !is_empty;
                         if was_empty != is_empty || is_typing {
-                            let envelope = network::MessageEnvelope::TypingIndicator { is_typing };
+                            let my_fp = self.app_state.get_fingerprint().unwrap_or_default();
+                            let port = self.listening_port.unwrap_or(network::DEFAULT_PORT);
+                            let envelope = network::MessageEnvelope::TypingIndicator { 
+                                is_typing,
+                                sender_fingerprint: my_fp,
+                                sender_listening_port: port,
+                            };
                             let addr = addr.clone();
                             let _ = std::thread::spawn(move || {
                                 let _ = network::NetworkHandle::send_message(&addr, envelope);
@@ -529,6 +566,28 @@ impl Application for CryptoChat {
                 self.unread_count = 0; // Clear unread when user is active
                 let content = self.message_input.clone();
                 self.message_input.clear();
+                
+                // Emote parsing
+                let mut emotes = std::collections::HashMap::new();
+                if let Ok(lib) = self.emote_manager.library.read() {
+                   for (name, emote) in lib.iter() {
+                       let pattern = format!(":{}:", name);
+                       if content.contains(&pattern) {
+                           emotes.insert(name.clone(), emote.hash.clone());
+                       }
+                   }
+                }
+                
+                let network_payload = if !emotes.is_empty() {
+                    let payload = EmotePayload {
+                        content: content.clone(),
+                        emotes: emotes.clone(),
+                    };
+                    serde_json::to_string(&payload).unwrap_or(content.clone())
+                } else {
+                    content.clone()
+                };
+
                 let new_msg = ChatMessage {
                     sender_name: self.my_username.clone(),
                     content: content.clone(),
@@ -537,13 +596,18 @@ impl Application for CryptoChat {
                     image_data: None,
                     image_filename: None,
                     reactions: Vec::new(),
+                    emotes: emotes,
                 };
-                save_message_to_history(&new_msg);
-                self.chat_messages.push(new_msg);
+                // save_message_to_history(&new_msg); // TODO: Refactor persistence
                 
                 // Route to group or direct peer
-                if let Some(ref group_id) = self.selected_group_id {
-                    // Group message mode - send to all members
+                // Route to group or direct peer
+                let group_id_opt = self.selected_group_id.clone();
+                if let Some(ref group_id) = group_id_opt {
+                    // Add to group conversation
+                    self.add_message(group_id.clone(), "Group".to_string(), new_msg.clone(), None);
+
+                    // Group message sending...
                     if let Some(group) = self.groups.iter().find(|g| &g.id == group_id) {
                         let member_addresses: Vec<String> = group.members.iter()
                             .filter(|m| m.fingerprint != self.app_state.get_fingerprint().unwrap_or_default())
@@ -562,7 +626,7 @@ impl Application for CryptoChat {
                             group_id: group_id_clone,
                             sender_fingerprint: fingerprint,
                             sender_name: username,
-                            encrypted_content: content, // TODO: encrypt with group key
+                            encrypted_content: network_payload, 
                             timestamp: chrono_time(),
                             expires_at: None,
                         };
@@ -573,7 +637,8 @@ impl Application for CryptoChat {
                         } else {
                             self.status = format!("Sent to {}/{} members", sent, member_addresses.len());
                         }
-                        Command::none()
+
+                        return self.snap_to_bottom(); // Snap after sending to group
                     } else {
                         self.status = "Group not found".to_string();
                         Command::none()
@@ -583,10 +648,25 @@ impl Application for CryptoChat {
                     let app_state = self.app_state.clone();
                     let peer_addr = self.peer_address.clone().unwrap();
                     let username = self.my_username.clone();
-                    Command::perform(
-                        async move { send_message_async(app_state, peer_addr, content, username).await },
-                        Message::MessageSent,
-                    )
+                    // Get fingerprint for adding to local convo
+                    if let Some(fp) = self.app_state.get_recipient_fingerprint() {
+                        self.add_message(fp, self.peer_username.clone().unwrap_or("Peer".to_string()), new_msg.clone(), Some(peer_addr.clone()));
+                    }
+                    
+                    let my_fp = self.app_state.get_fingerprint().unwrap_or_default();
+                    // Launch async task to send
+                    let app_state = self.app_state.clone();
+                    let port = self.listening_port.unwrap_or(network::DEFAULT_PORT);
+                    
+                    return Command::batch(vec![
+                        Command::perform(
+                            async move {
+                                 send_message_async(app_state, peer_addr, network_payload, username, my_fp, port).await
+                            },
+                            Message::MessageSent,
+                        ),
+                        self.snap_to_bottom()
+                    ]);
                 } else {
                     self.status = "Import a key or select a group first".to_string();
                     Command::none()
@@ -600,11 +680,21 @@ impl Application for CryptoChat {
             }
             Message::NetworkEvent(event) => {
                 match event {
-                    network::NetworkEvent::MessageReceived { encrypted_payload, sender_name } => {
+                    network::NetworkEvent::MessageReceived { encrypted_payload, sender_name, sender_fingerprint, sender_address } => {
                         match self.app_state.decrypt_message(&encrypted_payload) {
                             Ok(plaintext) => {
                                 let name = sender_name.unwrap_or_else(|| 
-                                    self.peer_username.clone().unwrap_or_else(|| "Peer".to_string())
+                                    // Try to find name in contacts if sender_name is missing
+                                    self.contacts.iter()
+                                        .find(|c| c.public_key.contains(&sender_fingerprint) || c.address.contains(&sender_fingerprint)) // Fuzzy fallback
+                                        .map(|c| c.name.clone())
+                                        .unwrap_or_else(|| {
+                                             if Some(sender_fingerprint.clone()) == self.app_state.get_recipient_fingerprint() {
+                                                 self.peer_username.clone().unwrap_or("Peer".to_string())
+                                             } else {
+                                                 "Unknown".to_string()
+                                             }
+                                        })
                                 );
                                 let new_msg = ChatMessage {
                                     sender_name: name.clone(),
@@ -614,24 +704,40 @@ impl Application for CryptoChat {
                                     image_data: None,
                                     image_filename: None,
                                     reactions: Vec::new(),
+                                    emotes: std::collections::HashMap::new(),
                                 };
-                                save_message_to_history(&new_msg);
-                                self.chat_messages.push(new_msg);
+                                // save_message_to_history(&new_msg); // TODO: Refactor persistence
+                                self.add_message(sender_fingerprint.clone(), name.clone(), new_msg, Some(sender_address.clone()));
                                 
                                 // Show notification and play sound
                                 show_notification(&format!("Message from {}", name), &plaintext);
                                 play_notification_sound();
-                                self.unread_count += 1;
-                                self.peer_is_typing = false; // They sent, so not typing
+                                
+                                // Reset typing indicator for this user
+                                if let Some(conv) = self.conversations.get_mut(&sender_fingerprint) {
+                                    conv.is_typing = false;
+                                }
+                                
+                                self.peer_is_typing = false; // Legacy global reset
                                 
                                 // Send read receipt
                                 if let Some(addr) = &self.peer_address {
-                                    let ts = chrono_time();
-                                    let envelope = network::MessageEnvelope::ReadReceipt { last_read_timestamp: ts };
-                                    let addr = addr.clone();
-                                    let _ = std::thread::spawn(move || {
-                                        let _ = network::NetworkHandle::send_message(&addr, envelope);
-                                    });
+                                    if Some(sender_fingerprint.clone()) == self.app_state.get_recipient_fingerprint() {
+                                        // Only send RR if we are currently looking at this person?
+                                        // Or always? Usually only if active.
+                                        let ts = chrono_time();
+                                        let my_fp = self.app_state.get_fingerprint().unwrap_or_default();
+                                        let port = self.listening_port.unwrap_or(network::DEFAULT_PORT);
+                                        let envelope = network::MessageEnvelope::ReadReceipt { 
+                                            last_read_timestamp: ts,
+                                            sender_fingerprint: my_fp,
+                                            sender_listening_port: port,
+                                        };
+                                        let addr = addr.clone();
+                                        let _ = std::thread::spawn(move || {
+                                            let _ = network::NetworkHandle::send_message(&addr, envelope);
+                                        });
+                                    }
                                 }
                                 
                                 // Sync username if changed
@@ -647,8 +753,19 @@ impl Application for CryptoChat {
                                     // Update on disk
                                     let _ = request_store::update_contact_name(&fp, &name);
                                 }
+                                
+                                // Sync peer_address for active conversation (enables bidirectional replies)
+                                if Some(&sender_fingerprint) == self.active_conversation_id.as_ref() {
+                                    self.peer_address = Some(sender_address.clone());
+                                    self.app_state.set_peer_address(sender_address.clone());
+                                    return self.snap_to_bottom();
+                                }
+                                Command::none()
+                            },
+                            Err(e) => {
+                                self.status = format!("Decrypt error: {}", e);
+                                Command::none()
                             }
-                            Err(e) => self.status = format!("Decrypt error: {}", e),
                         }
                     }
                     network::NetworkEvent::RequestReceived { sender_fingerprint, sender_public_key, sender_address, sender_name } => {
@@ -670,14 +787,23 @@ impl Application for CryptoChat {
                             play_notification_sound();
                             self.status = format!("Request from: {} (Accept/Decline)", name);
                         }
+                        Command::none()
                     }
-                    network::NetworkEvent::TypingUpdate { is_typing } => {
-                        self.peer_is_typing = is_typing;
+                    network::NetworkEvent::TypingUpdate { is_typing, sender_fingerprint, sender_address } => {
+                        if let Some(conv) = self.conversations.get_mut(&sender_fingerprint) {
+                            conv.is_typing = is_typing;
+                            conv.peer_address = Some(sender_address);
+                        }
+                        Command::none()
                     }
-                    network::NetworkEvent::ReadReceiptReceived { last_read_timestamp } => {
-                        self.peer_last_read = Some(last_read_timestamp);
+                    network::NetworkEvent::ReadReceiptReceived { last_read_timestamp, sender_fingerprint, sender_address } => {
+                        if let Some(conv) = self.conversations.get_mut(&sender_fingerprint) {
+                            conv.last_read = Some(last_read_timestamp);
+                            conv.peer_address = Some(sender_address);
+                        }
+                        Command::none()
                     }
-                    network::NetworkEvent::FileReceived { filename, encrypted_data, sender_name } => {
+                    network::NetworkEvent::FileReceived { filename, encrypted_data, sender_name, sender_fingerprint, sender_address } => {
                         // Decrypt and save file
                         use base64::Engine;
                         if let Ok(Some(stored_key)) = keystore::load_keypair() {
@@ -701,22 +827,22 @@ impl Application for CryptoChat {
                                             image_data: if is_image { Some(decrypted.clone()) } else { None },
                                             image_filename: Some(filename.clone()),
                                             reactions: Vec::new(),
+                                            emotes: std::collections::HashMap::new(),
                                         };
                                         
                                         // Don't save to history if it's an image (too large)
-                                        if !is_image {
-                                            save_message_to_history(&new_msg);
-                                        }
-                                        self.chat_messages.push(new_msg);
+                                        // if !is_image { save_message_to_history(&new_msg); } // TODO: Refactor persistence
+                                        self.add_message(sender_fingerprint.clone(), name.clone(), new_msg, Some(sender_address.clone()));
+                                        
                                         show_notification(&format!("File from {}", name), &format!("Received: {}", filename));
                                         play_notification_sound();
-                                        self.unread_count += 1;
-                                        self.peer_is_typing = false;
+                                        // unread handled by add_message
                                         self.status = format!("Received: {}", filename);
                                     }
                                 }
-                            }
                         }
+                    }
+                        Command::none()
                     }
                     network::NetworkEvent::ContactRemovalReceived { fingerprint } => {
                         // Peer removed us as a contact, remove them too
@@ -732,30 +858,35 @@ impl Application for CryptoChat {
                                 self.peer_username = None;
                             }
                         }
+                        Command::none()
                     }
                     network::NetworkEvent::GroupInviteReceived { group_id, group_name, .. } => {
                         // TODO: Implement pending group invites
                         self.status = format!("Received invite to group: {}", group_name);
                         show_notification("New Group Invite", &format!("Invited to {}", group_name));
                         // Later: Add to pending_groups list
+                        Command::none()
                     }
                     network::NetworkEvent::GroupMessageReceived { group_id, sender_fingerprint, sender_name, encrypted_content, timestamp, .. } => {
                         // Add received group message to chat
-                        if let Some(group) = self.groups.iter().find(|g| g.id == group_id) {
-                            let new_msg = ChatMessage {
-                                sender_name: sender_name.clone(),
-                                content: encrypted_content, // TODO: decrypt with group key
-                                is_mine: false,
-                                timestamp,
-                                image_data: None,
-                                image_filename: None,
-                                reactions: Vec::new(),
-                            };
-                            self.chat_messages.push(new_msg);
-                            show_notification(&format!("{} ({})", sender_name, group.name), "New group message");
-                            play_notification_sound();
-                            self.unread_count += 1;
-                        }
+                        // Decrypt group message (TODO: Implement Group Encryption)
+                        let new_msg = ChatMessage {
+                            sender_name: sender_name.clone(),
+                            content: encrypted_content, 
+                            is_mine: false,
+                            timestamp,
+                            image_data: None,
+                            image_filename: None,
+                            reactions: Vec::new(),
+                            emotes: std::collections::HashMap::new(),
+                        };
+                        // self.chat_messages.push(new_msg);
+                        self.add_message(group_id.clone(), "Group".to_string(), new_msg, None);
+                        
+                        show_notification(&format!("{} ({})", sender_name, "Group"), "New group message");
+                        play_notification_sound();
+                         // Unread handled in add_message
+                        Command::none()
                     }
                     
                     network::NetworkEvent::GroupJoinReceived { group_id, new_member, sender_address } => {
@@ -787,6 +918,7 @@ impl Application for CryptoChat {
                                 }
                             }
                         }
+                        Command::none()
                     }
                     
                     network::NetworkEvent::GroupMemberSyncReceived { group_id, members } => {
@@ -810,18 +942,53 @@ impl Application for CryptoChat {
                                 }
                             }
                         }
+                        Command::none()
                     }
                     
-                    network::NetworkEvent::ReactionReceived { msg_timestamp, emoji, sender_name } => {
-                        // Find message by timestamp and add reaction
-                        if let Some(msg) = self.chat_messages.iter_mut().find(|m| m.timestamp == msg_timestamp) {
-                            msg.reactions.push((emoji, sender_name));
+                    network::NetworkEvent::ReactionReceived { msg_timestamp, emoji, sender_name, sender_fingerprint, sender_address } => {
+                        // Find message by timestamp and update reaction (toggle)
+                        // Try to find conversation (DM for now - active refactor limitation)
+                        if let Some(conv) = self.conversations.get_mut(&sender_fingerprint) {
+                            conv.peer_address = Some(sender_address);
+                            if let Some(msg) = conv.messages.iter_mut().find(|m| m.timestamp == msg_timestamp) {
+                                // Check if sender already reacted with this emoji (toggle off)
+                                if let Some(pos) = msg.reactions.iter().position(|(e, s)| e == &emoji && s == &sender_name) {
+                                    msg.reactions.remove(pos);
+                                } else {
+                                    msg.reactions.push((emoji, sender_name));
+                                }
+                            }
                         }
+                        Command::none()
                     }
                     
-                    network::NetworkEvent::Error(e) => self.status = format!("Network: {}", e),
+                    network::NetworkEvent::EmoteRequestReceived { hash, sender_addr_raw } => {
+                        use base64::Engine;
+                        if let Some(path) = self.emote_manager.get_emote_path(&hash) {
+                            if let Ok(data) = std::fs::read(&path) {
+                                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                                let envelope = network::MessageEnvelope::EmoteData { hash, data: encoded };
+                                let _ = std::thread::spawn(move || {
+                                    let _ = network::NetworkHandle::send_message(&sender_addr_raw, envelope);
+                                });
+                            }
+                        }
+                        Command::none()
+                    }
+                    
+                    network::NetworkEvent::EmoteDataReceived { hash, data } => {
+                        use base64::Engine;
+                         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data) {
+                             let _ = self.emote_manager.save_to_cache(&hash, &bytes);
+                         }
+                        Command::none()
+                    }
+                    
+                    network::NetworkEvent::Error(e) => {
+                        self.status = format!("Network: {}", e);
+                        Command::none()
+                    },
                 }
-                Command::none()
             }
             Message::PollNetwork => {
                 if let Some(receiver_mutex) = NETWORK_RECEIVER.get() {
@@ -908,45 +1075,86 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::ClearHistory => {
-                self.chat_messages.clear();
-                let _ = request_store::save_chat_history(&[]);
-                self.status = "History cleared".to_string();
+                if let Some(conv) = self.get_active_conversation_mut() {
+                    conv.messages.clear();
+                    // request_store::clear_history(); // TODO: Clear per-user history
+                    self.status = "History cleared".to_string();
+                } else {
+                     self.status = "No active chat to clear".to_string();
+                }
                 Command::none()
             }
             Message::SelectContact(index) => {
-                // Guard: Don't allow if already connected
-                if self.recipient_key_imported {
-                    self.status = "Already connected. Disconnect first.".to_string();
-                    return Command::none();
-                }
                 if let Some(contact) = self.contacts.get(index) {
-                    // Set up connection to this contact
-                    if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&contact.public_key) {
-                        self.app_state.set_recipient_keypair(keypair);
+                     let fp = contact.fingerprint.clone();
+                     let name = contact.name.clone();
+                     let address = contact.address.clone();
+                     
+                     // Create conversation if it doesn't exist (using add_message to initialize)
+                     if !self.conversations.contains_key(&fp) {
+                        // We need a dummy message to init? Or just create entry?
+                        // add_message appends message. 
+                        // Let's manually create entry to avoid dummy message if possible, or use system message.
+                        // Actually add_message is fine.
+                        // But wait, add_message signature wants ChatMessage.
+                        // I'll manually insert.
+                        let conv = Conversation::new(fp.clone(), name, Some(address));
+                        self.conversations.insert(fp.clone(), conv);
+                     }
+                     
+                     // Trigger SelectConversation
+                     // recursive update call or duplication? Duplication is safer for borrow checker.
+                     // Logic of SelectConversation:
+                     self.active_conversation_id = Some(fp.clone());
+                     
+                     // Load contact details
+                        if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&contact.public_key) {
+                            self.app_state.set_recipient_keypair(keypair);
+                        }
                         self.app_state.set_peer_address(contact.address.clone());
                         self.peer_address = Some(contact.address.clone());
                         self.peer_username = Some(contact.name.clone());
                         self.recipient_key_imported = true;
-                        self.status = format!("Reconnected to {}!", contact.name);
+                        self.status = format!("Chatting with {}", contact.name);
+                        self.selected_group_id = None; 
                         
-                        // Send our key so they can respond
-                        if let (Ok(Some(our_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
-                            let envelope = network::MessageEnvelope::AcceptedResponse {
-                                sender_fingerprint: our_key.fingerprint.clone(),
-                                sender_public_key: our_key.public_key_armored.clone(),
-                                sender_listening_port: port,
-                                sender_name: Some(self.my_username.clone()),
-                            };
-                            let peer_addr = contact.address.clone();
-                            return Command::perform(
-                                async move {
-                                    network::NetworkHandle::send_message(&peer_addr, envelope)
-                                        .map_err(|e| e.to_string())
-                                },
-                                |r| Message::MessageSent(r),
-                            );
-                        }
-                    }
+                        return self.snap_to_bottom();
+                }
+                Command::none()
+            }
+            Message::SelectConversation(id) => {
+                if let Some(conv) = self.conversations.get(&id) {
+                     self.active_conversation_id = Some(id.clone());
+                     self.peer_username = Some(conv.name.clone());
+                     self.peer_address = conv.peer_address.clone();
+                     self.selected_group_id = None; 
+                     
+                     // Try to match with contact to load key
+                     if let Some(contact) = self.contacts.iter().find(|c| c.fingerprint == id) {
+                         if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&contact.public_key) {
+                             self.app_state.set_recipient_keypair(keypair);
+                             self.recipient_key_imported = true;
+                         }
+                         if let Some(ref addr) = conv.peer_address {
+                             self.app_state.set_peer_address(addr.clone());
+                         }
+                     } else {
+                         // Maybe it's a group?
+                         if let Some(group) = self.groups.iter().find(|g| g.id == id) {
+                             self.selected_group_id = Some(id.clone());
+                             // Group logic...
+                         } else {
+                             // Unknown peer (stranger). Key should be in AppState if imported manually?
+                             // But switching away and back might lose it if we rely on AppState only?
+                             // Needed: Store keys in Conversation? Or KeyStore? 
+                             // Phase 3 stuff. For now, assume if not in contacts, we might lose key on switch if not persisted.
+                             // But we load from keystore usually.
+                         }
+                     }
+                     
+                     self.status = format!("Chatting with {}", conv.name);
+                     
+                     return self.snap_to_bottom();
                 }
                 Command::none()
             }
@@ -959,39 +1167,64 @@ impl Application for CryptoChat {
                 let app_state = self.app_state.clone();
                 let peer_addr = self.peer_address.clone();
                 let sender_name = self.my_username.clone();
+                let my_fp = self.app_state.get_fingerprint().unwrap_or_default();
+                let port = self.listening_port.unwrap_or(network::DEFAULT_PORT);
                 return Command::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            pick_and_send_file(app_state, peer_addr, sender_name)
+                            pick_and_send_file(app_state, peer_addr, sender_name, my_fp, port)
                         }).await.map_err(|e| e.to_string())?
                     },
                     |r| Message::FileSent(r),
                 );
             }
+            Message::UploadEmote => {
+                 self.status = "Opening file picker...".to_string();
+                 return Command::perform(
+                    async {
+                        tokio::task::spawn_blocking(|| {
+                            pick_emote_file()
+                        }).await.map_err(|e| e.to_string())?
+                    },
+                    |res| match res {
+                        Ok(Some(path)) => Message::EmoteFileSelected(Some(path)),
+                        _ => Message::EmoteFileSelected(None),
+                    }
+                );
+            }
+            Message::EmoteFileSelected(opt_path) => {
+                if let Some(path) = opt_path {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let name = stem.to_string();
+                        // Import into manager
+                        match self.emote_manager.import_emote(&path, name.clone()) {
+                            Ok(_) => self.status = format!("Emote imported: :{} :", name),
+                            Err(e) => self.status = format!("Import failed: {}", e),
+                        }
+                    }
+                }
+                Command::none()
+            }
             Message::FileSent(result) => {
-                match result {
-                    Ok((filename, file_data)) => {
-                        self.status = format!("Sent: {}", filename);
-                        
-                        // Check if this is an image and add to sender's chat
-                        let is_image = filename.to_lowercase().ends_with(".png") 
-                            || filename.to_lowercase().ends_with(".jpg")
-                            || filename.to_lowercase().ends_with(".jpeg")
-                            || filename.to_lowercase().ends_with(".gif")
-                            || filename.to_lowercase().ends_with(".bmp");
-                        
+                if let Err(e) = result {
+                    self.status = format!("File send failed: {}", e);
+                } else if let Ok((filename, raw_data)) = result {
+                     if let Some(fp) = self.app_state.get_recipient_fingerprint() {
+                        let is_image = filename.to_lowercase().ends_with(".png") || filename.to_lowercase().ends_with(".jpg");
+                         
                         let new_msg = ChatMessage {
                             sender_name: self.my_username.clone(),
                             content: if is_image { format!("[Image: {}]", filename) } else { format!("[File: {}]", filename) },
                             is_mine: true,
                             timestamp: chrono_time(),
-                            image_data: if is_image { Some(file_data) } else { None },
+                            image_data: if is_image { Some(raw_data.clone()) } else { None },
                             image_filename: Some(filename),
                             reactions: Vec::new(),
+                            emotes: std::collections::HashMap::new(),
                         };
-                        self.chat_messages.push(new_msg);
-                    }
-                    Err(e) => self.status = format!("Send failed: {}", e),
+                        // self.chat_messages.push(new_msg);
+                        self.add_message(fp, self.peer_username.clone().unwrap(), new_msg, None);
+                     }
                 }
                 Command::none()
             }
@@ -1039,8 +1272,7 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::SaveImage(index) => {
-                // Save image from inline preview to disk
-                if let Some(msg) = self.chat_messages.get(index) {
+                if let Some(msg) = self.get_active_messages().get(index) {
                     if let (Some(data), Some(filename)) = (&msg.image_data, &msg.image_filename) {
                         let downloads_dir = format!("{}\\Downloads", std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Public".to_string()));
                         let _ = std::fs::create_dir_all(&downloads_dir);
@@ -1068,11 +1300,29 @@ impl Application for CryptoChat {
                     if let Ok(keypair) = cryptochat_crypto_core::pgp::PgpKeyPair::from_public_key(&req.sender_public_key) {
                         self.app_state.set_recipient_keypair(keypair);
                         self.app_state.set_peer_address(req.sender_address.clone());
+                        let peer_addr = req.sender_address.clone();
                         self.peer_address = Some(req.sender_address);
                         self.peer_username = req.sender_name;
                         self.recipient_key_imported = true;
                         self.status = format!("Connected: {}", name);
                         self.view = View::Chat;
+                        
+                        // Send AcceptedResponse back to requester so they establish connection too
+                        if let (Ok(Some(our_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
+                            let envelope = network::MessageEnvelope::AcceptedResponse {
+                                sender_fingerprint: our_key.fingerprint.clone(),
+                                sender_public_key: our_key.public_key_armored.clone(),
+                                sender_listening_port: port,
+                                sender_name: Some(self.my_username.clone()),
+                            };
+                            return Command::perform(
+                                async move {
+                                    network::NetworkHandle::send_message(&peer_addr, envelope)
+                                        .map_err(|e| e.to_string())
+                                },
+                                |result| Message::MessageSent(result),
+                            );
+                        }
                     } else {
                         self.status = format!("Failed to import key from {}", name);
                     }
@@ -1473,8 +1723,17 @@ impl Application for CryptoChat {
                 self.color_prefs.bubble_style = color_store::BubbleStyle::Rainbow { speed };
                 Command::none()
             }
+            Message::SetTheirBubbleColor(color) => {
+                self.color_prefs.their_bubble_color = color;
+                Command::none()
+            }
             Message::SaveColorPrefs => {
                 // Apply the color to theme immediately
+                // Apply "their" color
+                if let Some((r, g, b)) = color_store::hex_to_rgb(&self.color_prefs.their_bubble_color) {
+                    theme::set_their_bubble_color(r, g, b);
+                }
+                
                 match &self.color_prefs.bubble_style {
                     color_store::BubbleStyle::Solid { color } => {
                         if let Some((r, g, b)) = color_store::hex_to_rgb(color) {
@@ -1525,24 +1784,37 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::AddReaction(msg_idx, emoji) => {
-                // Add reaction to message and send to peer
-                if let Some(msg) = self.chat_messages.get_mut(msg_idx) {
+                let my_username_clone = self.my_username.clone();
+                if let Some(conv) = self.get_active_conversation_mut() {
+                   if let Some(msg) = conv.messages.get_mut(msg_idx) {
                     let msg_timestamp = msg.timestamp.clone();
-                    msg.reactions.push((emoji.clone(), self.my_username.clone()));
+                    
+                    // Check if user already reacted with this emoji (toggle off)
+                    if let Some(pos) = msg.reactions.iter().position(|(e, sender)| e == &emoji && sender == &my_username_clone) {
+                        msg.reactions.remove(pos);
+                    } else {
+                        msg.reactions.push((emoji.clone(), my_username_clone.clone()));
+                    }
                     
                     // Send reaction to peer
                     if let Some(ref addr) = self.peer_address {
+                        let my_fp = self.app_state.get_fingerprint().unwrap_or_default();
+                        let port = self.listening_port.unwrap_or(network::DEFAULT_PORT);
                         let envelope = network::MessageEnvelope::Reaction {
                             msg_timestamp,
                             emoji,
-                            sender_name: self.my_username.clone(),
+                            sender_name: my_username_clone,
+                            sender_fingerprint: my_fp,
+                            sender_listening_port: port,
                         };
                         let addr = addr.clone();
                         let _ = std::thread::spawn(move || {
                             let _ = network::NetworkHandle::send_message(&addr, envelope);
                         });
                     }
+                    }
                 }
+
                 self.reaction_picker_for_msg = None;
                 Command::none()
             }
@@ -1553,7 +1825,12 @@ impl Application for CryptoChat {
         let content: Element<Message> = match self.view {
             View::Login => self.view_login(),
             View::Onboarding => self.view_onboarding(),
-            View::Chat => self.view_chat(),
+            View::Chat => {
+                row![
+                    container(self.view_sidebar()).width(Length::Fixed(250.0)),
+                    container(self.view_chat()).width(Length::Fill)
+                ].into()
+            },
         };
         container(content).width(Length::Fill).height(Length::Fill).into()
     }
@@ -1631,6 +1908,8 @@ fn pick_and_send_file(
     app_state: Arc<app::AppState>,
     peer_addr: Option<String>,
     sender_name: String,
+    sender_fingerprint: String,
+    listening_port: u16,
 ) -> Result<(String, Vec<u8>), String> {
     let peer_addr = peer_addr.ok_or("No peer connected")?;
     
@@ -1677,6 +1956,8 @@ if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName } else { '' }
         filename: filename.clone(),
         encrypted_data: encoded,
         sender_name: Some(sender_name),
+        sender_fingerprint,
+        sender_listening_port: listening_port,
     };
     
     network::NetworkHandle::send_message(&peer_addr, envelope)
@@ -1684,6 +1965,27 @@ if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName } else { '' }
     
     // Return filename and raw data for sender's display
     Ok((filename, file_data))
+}
+
+fn pick_emote_file() -> Result<Option<std::path::PathBuf>, String> {
+    let ps_cmd = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Select Emote Image'
+$dialog.Filter = 'Images (*.png;*.jpg;*.jpeg;*.gif)|*.png;*.jpg;*.jpeg;*.gif|All Files (*.*)|*.*'
+if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName } else { '' }
+"#;
+    
+    let output = std::process::Command::new("powershell")
+        .args(["-WindowStyle", "Hidden", "-Sta", "-Command", ps_cmd])
+        .output()
+        .map_err(|e| format!("File picker failed: {}", e))?;
+    
+    let file_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if file_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(std::path::PathBuf::from(file_path)))
 }
 
 /// Show Windows toast notification
@@ -1811,6 +2113,7 @@ fn load_chat_history_sync() -> Vec<ChatMessage> {
             image_data: None,  // Images not stored in history
             image_filename: None,
             reactions: Vec::new(),
+            emotes: m.emotes,
         })
         .collect()
 }
@@ -1822,6 +2125,7 @@ fn save_message_to_history(msg: &ChatMessage) {
         is_mine: msg.is_mine,
         timestamp: msg.timestamp.clone(),
         expires_at: None, // TODO: Add disappearing timer support
+        emotes: msg.emotes.clone(),
     };
     
     // Try to get fingerprint for encrypted storage
@@ -1872,15 +2176,72 @@ async fn import_key_share_async(app_state: Arc<app::AppState>, input: String) ->
     }).await.map_err(|e| format!("{}", e))?
 }
 
-async fn send_message_async(app_state: Arc<app::AppState>, peer_address: String, content: String, username: String) -> Result<(), String> {
+async fn send_message_async(app_state: Arc<app::AppState>, peer_address: String, content: String, username: String, sender_fingerprint: String, sender_listening_port: u16) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let encrypted = app_state.encrypt_message(&content).map_err(|e| format!("{}", e))?;
-        let envelope = network::MessageEnvelope::RegularMessage { encrypted_payload: encrypted, sender_name: Some(username) };
+        let envelope = network::MessageEnvelope::RegularMessage { 
+            encrypted_payload: encrypted, 
+            sender_name: Some(username), 
+            sender_fingerprint,
+            sender_listening_port,
+        };
         network::NetworkHandle::send_message(&peer_address, envelope).map_err(|e| format!("{}", e))
     }).await.map_err(|e| format!("{}", e))?
 }
 
 impl CryptoChat {
+    fn get_active_messages(&self) -> &[ChatMessage] {
+        if let Some(id) = &self.active_conversation_id {
+            if let Some(conv) = self.conversations.get(id) {
+                return &conv.messages;
+            }
+        }
+        &[]
+    }
+    
+    fn get_active_conversation_mut(&mut self) -> Option<&mut Conversation> {
+        if let Some(id) = self.active_conversation_id.as_ref() {
+            return self.conversations.get_mut(id);
+        }
+        None
+    }
+    
+    fn snap_to_bottom(&self) -> Command<Message> {
+        scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset::END)
+    }
+
+    fn save_conversations(&self) {
+        if let Some(fp) = self.app_state.get_fingerprint() {
+            if let Err(e) = conversation_store::save_conversations(&self.conversations, &fp) {
+                eprintln!("Failed to save conversations: {}", e);
+            }
+        }
+    }
+
+    fn add_message(&mut self, fingerprint: String, name: String, msg: ChatMessage, peer_address: Option<String>) {
+        let active_id = self.active_conversation_id.clone();
+        let conv = self.conversations.entry(fingerprint.clone()).or_insert_with(|| {
+             Conversation::new(fingerprint.clone(), name, peer_address.clone())
+        });
+        
+        // Update peer address if provided
+        if let Some(addr) = peer_address {
+            conv.peer_address = Some(addr);
+        }
+        
+        conv.messages.push(msg);
+        
+        // Update activity timestamp
+        conv.last_activity = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        
+        // Update unread if not active
+        if Some(&fingerprint) != active_id.as_ref() {
+            conv.unread_count += 1;
+        }
+        
+        self.save_conversations();
+    }
+
     fn view_login(&self) -> Element<Message> {
         let has_account = account_store::account_exists();
         
@@ -1973,23 +2334,23 @@ impl CryptoChat {
         ].align_items(iced::Alignment::Center).width(Length::Fill).into()
     }
     
-    fn view_chat(&self) -> Element<Message> {
-        // Sidebar
+    fn view_sidebar(&self) -> Element<Message> {
+        // --- 1. Identity & Config ---
         let fingerprint = self.app_state.get_fingerprint().map(|f| f[..12].to_string()).unwrap_or_default();
         let port = self.listening_port.map(|p| p.to_string()).unwrap_or_else(|| "...".into());
-        
+
         let username_section = column![
             text("Your Name:").size(11),
             text_input("Username", &self.my_username)
                 .on_input(Message::UsernameChanged)
                 .padding(6).size(12),
-        ];
-        
+        ].spacing(2);
+
         let copy_btn = button(text("Copy Key").size(11)).padding([5, 8]).on_press(Message::CopyKeyShare);
         let qr_btn = button(text("Show QR").size(11)).padding([5, 8]).on_press(Message::ShowQR);
         let copy_qr_btn = button(text("Copy QR").size(11)).padding([5, 8]).on_press(Message::CopyQR);
         let scan_qr_btn = button(text("Scan QR").size(11)).padding([5, 8]).on_press(Message::ScanQR);
-        
+
         let import_section = if self.recipient_key_imported {
             let peer_name = self.peer_username.as_deref().unwrap_or("Connected");
             column![text(format!("Connected to: {}", peer_name)).size(11)]
@@ -2003,13 +2364,40 @@ impl CryptoChat {
                 ].spacing(4),
             ].spacing(4)
         };
-        
-        let clear_btn = button(text("Clear History").size(10)).padding([4, 8]).on_press(Message::ClearHistory);
+
         let theme_label = if self.dark_mode { "Light Mode" } else { "Dark Mode" };
         let theme_btn = button(text(theme_label).size(10)).padding([4, 8]).on_press(Message::ToggleTheme);
         let settings_btn = button(text("⚙ Colors").size(10)).padding([4, 8]).on_press(Message::ToggleSettings);
+        let clear_btn = button(text("Clear History").size(10)).padding([4, 8]).on_press(Message::ClearHistory);
+
+        // --- 2. Conversations (Active Chats) ---
+        let mut convs: Vec<&Conversation> = self.conversations.values().collect();
+        convs.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
         
-        // Pending connection requests with Accept/Decline
+        let chats_list: Element<Message> = if convs.is_empty() {
+            container(text("No active chats").size(12).style(iced::theme::Text::Color(iced::Color::from_rgb(0.7, 0.7, 0.7)))).padding(10).into()
+        } else {
+            column(
+                convs.iter().map(|c| {
+                    let is_active = self.active_conversation_id.as_ref() == Some(&c.id);
+                    let btn_text = if c.unread_count > 0 {
+                        format!("{} ({})", c.name, c.unread_count) 
+                    } else {
+                        c.name.clone()
+                    };
+                    
+                    let label = if is_active { format!("> {}", btn_text) } else { btn_text };
+                    
+                    button(text(label).size(12))
+                        .width(Length::Fill)
+                        .padding(8)
+                        .on_press(Message::SelectConversation(c.id.clone()))
+                        .into()
+                }).collect::<Vec<_>>()
+            ).spacing(2).into()
+        };
+
+        // --- 3. Requests ---
         let pending_section: Element<Message> = if self.pending_requests.is_empty() {
             Space::with_height(0).into()
         } else {
@@ -2028,10 +2416,10 @@ impl CryptoChat {
                 column(pending_rows).spacing(4),
             ].spacing(4).into()
         };
-        
-        // Build contacts list with delete buttons
+
+        // --- 4. Contacts ---
         let contacts_section: Element<Message> = if self.contacts.is_empty() {
-            text("No saved contacts").size(9).into()
+            text("No saved contacts").size(9).style(iced::theme::Text::Color(iced::Color::from_rgb(0.6,0.6,0.6))).into()
         } else {
             let contact_rows: Vec<Element<Message>> = self.contacts.iter().enumerate().map(|(i, c)| {
                 row![
@@ -2045,133 +2433,147 @@ impl CryptoChat {
             }).collect();
             column(contact_rows).spacing(2).into()
         };
-        
-        let sidebar = container(
-            column![
-                text("CryptoChat").size(16),
-                Space::with_height(8),
-                text(format!("ID: {}...", fingerprint)).size(10),
-                text(format!("Port: {}", port)).size(10),
-                Space::with_height(10),
-                username_section,
-                Space::with_height(10),
-                text("Share your key:").size(10),
-                row![copy_btn, copy_qr_btn].spacing(4),
-                row![qr_btn].spacing(4),
-                Space::with_height(12),
-                import_section,
-                Space::with_height(12),
-                pending_section,
-                text("Contacts:").size(10),
-                contacts_section,
-                Space::with_height(12),
-                row![
-                    text("Groups:").size(10),
-                    button(text("+").size(10)).padding([2, 6]).on_press(Message::CreateGroup),
-                ].spacing(4).align_items(iced::Alignment::Center),
-                {
-                    let groups_list: Element<Message> = if let Some(ref pending_id) = self.pending_group_delete {
-                        // Show confirmation dialog
-                        let group_name = self.groups.iter()
-                            .find(|g| &g.id == pending_id)
-                            .map(|g| g.name.as_str())
-                            .unwrap_or("Unknown");
-                        column![
-                            text(format!("Delete '{}'?", group_name)).size(10),
-                            row![
-                                button(text("Yes").size(9)).padding([3, 8]).on_press(Message::ConfirmDeleteGroup(pending_id.clone())),
-                                button(text("No").size(9)).padding([3, 8]).on_press(Message::CancelDeleteGroup),
-                            ].spacing(4),
-                        ].spacing(4).into()
-                    } else if self.groups.is_empty() {
-                        text("No groups yet").size(9).into()
-                    } else {
-                        column(
-                            self.groups.iter().map(|g| {
-                                row![
-                                    button(text(&g.name).size(10))
-                                        .padding([4, 8])
-                                        .on_press(Message::SelectGroup(g.id.clone())),
-                                    button(text("📋").size(9))
-                                        .padding([3, 5])
-                                        .on_press(Message::CopyGroupKey(g.id.clone())),
-                                    button(text("X").size(9))
-                                        .padding([3, 5])
-                                        .on_press(Message::RequestDeleteGroup(g.id.clone())),
-                                ].spacing(2).into()
-                            }).collect::<Vec<Element<Message>>>()
-                        ).spacing(2).into()
-                    };
-                    groups_list
-                },
-                Space::with_height(8),
-                {
-                    // Join Group section with input and preview
-                    let join_section: Element<Message> = if self.group_invite_input.is_empty() {
-                        column![
-                            text("Join Group:").size(9),
-                            text_input("Paste invite...", &self.group_invite_input)
-                                .on_input(Message::GroupInviteInputChanged)
-                                .padding(4).size(9),
+
+        // --- 5. Groups ---
+        let groups_section: Element<Message> = {
+            let groups_list: Element<Message> = if let Some(ref pending_id) = self.pending_group_delete {
+                // Confirmation dialog
+                let group_name = self.groups.iter().find(|g| &g.id == pending_id).map(|g| g.name.as_str()).unwrap_or("?");
+                column![
+                     text(format!("Delete '{}'?", group_name)).size(10),
+                     row![
+                         button(text("Yes").size(9)).padding([3, 8]).on_press(Message::ConfirmDeleteGroup(pending_id.clone())),
+                         button(text("No").size(9)).padding([3, 8]).on_press(Message::CancelDeleteGroup),
+                     ].spacing(4),
+                ].spacing(4).into()
+            } else if self.groups.is_empty() {
+                text("No groups yet").size(9).style(iced::theme::Text::Color(iced::Color::from_rgb(0.6,0.6,0.6))).into()
+            } else {
+                 column(
+                    self.groups.iter().map(|g| {
+                        row![
+                            button(text(&g.name).size(10)).padding([4, 8]).on_press(Message::SelectGroup(g.id.clone())),
+                            button(text("📋").size(9)).padding([3, 5]).on_press(Message::CopyGroupKey(g.id.clone())),
+                            button(text("X").size(9)).padding([3, 5]).on_press(Message::RequestDeleteGroup(g.id.clone())),
                         ].spacing(2).into()
+                    }).collect::<Vec<_>>()
+                ).spacing(2).into()
+            };
+            
+            // Group Join Section
+            let join_section: Element<Message> = if self.group_invite_input.is_empty() {
+                column![
+                    text("Join Group:").size(9),
+                    text_input("Paste invite...", &self.group_invite_input)
+                        .on_input(Message::GroupInviteInputChanged)
+                        .padding(4).size(9),
+                ].spacing(2).into()
+            } else {
+                // Parse preview
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&self.group_invite_input) {
+                    if json_val.get("type").and_then(|t| t.as_str()) == Some("group_invite") {
+                        let name = json_val.get("group_name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let creator = json_val.get("creator").and_then(|v| v.as_str()).unwrap_or("?");
+                        let members = json_val.get("members").and_then(|v| v.as_i64()).unwrap_or(1);
+                        column![
+                            text(format!("📌 {}", name)).size(10),
+                            text(format!("By: {} • {} members", creator, members)).size(8),
+                            row![
+                                button(text("Join").size(9)).padding([3, 8]).on_press(Message::JoinGroup),
+                                button(text("✕").size(9)).padding([3, 6]).on_press(Message::GroupInviteInputChanged(String::new())),
+                            ].spacing(4),
+                        ].spacing(3).into()
                     } else {
-                        // Try to parse and show preview
-                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&self.group_invite_input) {
-                            if json_val.get("type").and_then(|t| t.as_str()) == Some("group_invite") {
-                                let name = json_val.get("group_name").and_then(|v| v.as_str()).unwrap_or("?");
-                                let creator = json_val.get("creator").and_then(|v| v.as_str()).unwrap_or("?");
-                                let members = json_val.get("members").and_then(|v| v.as_i64()).unwrap_or(1);
-                                column![
-                                    text(format!("📌 {}", name)).size(10),
-                                    text(format!("By: {} • {} members", creator, members)).size(8),
-                                    row![
-                                        button(text("Join").size(9)).padding([3, 8]).on_press(Message::JoinGroup),
-                                        button(text("✕").size(9)).padding([3, 6]).on_press(Message::GroupInviteInputChanged(String::new())),
-                                    ].spacing(4),
-                                ].spacing(3).into()
-                            } else {
-                                column![
-                                    text("❌ Not a group invite").size(9),
-                                    button(text("Clear").size(8)).padding([2, 6]).on_press(Message::GroupInviteInputChanged(String::new())),
-                                ].spacing(2).into()
-                            }
-                        } else {
-                            column![
-                                text_input("Paste invite...", &self.group_invite_input)
-                                    .on_input(Message::GroupInviteInputChanged)
-                                    .padding(4).size(9),
-                            ].into()
-                        }
-                    };
-                    join_section
-                },
-                Space::with_height(Length::Fill),
-                row![theme_btn, settings_btn, clear_btn].spacing(4),
-            ].padding(10).spacing(2)
-        ).width(260).height(Length::Fill);
-        
+                        column![
+                            text("❌ Invalid").size(9),
+                            button(text("Clear").size(8)).padding([2, 6]).on_press(Message::GroupInviteInputChanged(String::new())),
+                        ].spacing(2).into()
+                    }
+                } else {
+                    column![
+                        text_input("Paste invite...", &self.group_invite_input)
+                            .on_input(Message::GroupInviteInputChanged)
+                            .padding(4).size(9),
+                    ].into()
+                }
+            };
+
+            column![
+                 row![
+                     text("Groups:").size(10),
+                     button(text("+").size(10)).padding([2, 6]).on_press(Message::CreateGroup),
+                 ].spacing(4).align_items(iced::Alignment::Center),
+                 groups_list,
+                 join_section
+            ].spacing(4).into()
+        };
+
+        // --- Combine Sidebar ---
+        let content = column![
+             text("CryptoChat").size(16).font(EMOJI_FONT),
+             text(format!("ID: {}...", fingerprint)).size(10),
+             text(format!("Port: {}", port)).size(10),
+             Space::with_height(10),
+             
+             username_section,
+             Space::with_height(10),
+             
+             text("Share:").size(10),
+             row![copy_btn, copy_qr_btn].spacing(4),
+             row![qr_btn].spacing(4),
+             Space::with_height(10),
+             
+             import_section,
+             Space::with_height(20),
+             
+             text("Chats").size(14).font(EMOJI_FONT),
+             chats_list,
+             Space::with_height(10),
+             
+             pending_section,
+             Space::with_height(10),
+
+             text("Contacts").size(12),
+             contacts_section,
+             Space::with_height(10),
+
+             groups_section,
+             
+             Space::with_height(20),
+             row![theme_btn, settings_btn, clear_btn].spacing(2),
+        ]
+        .spacing(4)
+        .padding(10);
+
+        scrollable(content).into()
+    }
+
+    fn view_chat(&self) -> Element<Message> {
         // Chat bubbles
-        let messages_view: Element<Message> = if self.chat_messages.is_empty() {
+        let messages_view: Element<Message> = if self.get_active_messages().is_empty() {
             container(
                 column![
                     text("How to connect:").size(14),
-                    text("1. Set your username above").size(12),
-                    text("2. Copy Key Share").size(12),
-                    text("3. Send to peer").size(12),
-                    text("4. Import peer's key").size(12),
+                    text("1. Set your username in the sidebar").size(12),
+                    text("2. Share your key with a peer").size(12),
+                    text("3. Import their key").size(12),
+                    text("4. Select the chat to start messaging!").size(12),
                 ].spacing(4).align_items(iced::Alignment::Center)
             ).width(Length::Fill).height(Length::Fill).center_x().center_y().into()
         } else {
-            let bubbles: Vec<Element<Message>> = self.chat_messages.iter().enumerate().map(|(idx, msg)| {
+            let bubbles: Vec<Element<Message>> = self.get_active_messages().iter().enumerate().map(|(idx, msg)| {
                 self.render_bubble(msg, idx)
             }).collect();
-            scrollable(column(bubbles).spacing(8).padding(16)).width(Length::Fill).height(Length::Fill).into()
+            scrollable(iced::widget::Column::with_children(bubbles).spacing(8).padding(16))
+                .id(self.scroll_id.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         };
         
         // Typing indicator with animated dots
         let typing_indicator: Element<Message> = if self.peer_is_typing {
             let name = self.peer_username.as_deref().unwrap_or("Peer");
-            // Animated dots based on phase (0=".", 1="..", 2="...")
             let dots = match self.typing_dots_phase {
                 0 => "●  ",
                 1 => "● ●",
@@ -2185,18 +2587,16 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
-        // Input area with action bar
-        // Can send if: 1) have 1-on-1 connection OR 2) have a group selected
+        // Input area
         let can_send = self.recipient_key_imported || self.selected_group_id.is_some();
-        let input_area = if can_send {
-            // Action bar with buttons
-            let action_bar = row![
-                button(text("[+] File")).padding([6, 10]).on_press(Message::PickFile),
+        let input_area: Element<Message> = if can_send {
+            let action_bar: iced::widget::Row<'_, Message> = row![
+                button(text("📎").font(EMOJI_FONT)).padding(10).on_press(Message::PickFile),
+                button(text("✨").font(EMOJI_FONT)).padding(10).on_press(Message::UploadEmote),
                 button(text("[:] Emoji")).padding([6, 10]).on_press(Message::ToggleEmojiPicker),
             ].spacing(8);
             
-            // Message input row
-            let message_row = row![
+            let message_row: iced::widget::Row<'_, Message> = row![
                 text_input("Type a message...", &self.message_input)
                     .on_input(Message::MessageInputChanged)
                     .on_submit(Message::SendMessage)
@@ -2204,16 +2604,12 @@ impl CryptoChat {
                 button(text("Send")).padding([10, 16]).on_press(Message::SendMessage),
             ].spacing(8);
             
-            column![action_bar, message_row].spacing(6).padding(12)
+            column![action_bar, message_row].spacing(6).padding(12).into()
         } else {
-            let message_row = row![
-                text_input("Connect first...", "").padding(10).size(14),
-                button(text("Send")).padding([10, 16]),
-            ].spacing(8);
-            column![message_row].padding(12)
+            Space::with_height(0).into()
         };
         
-        // Emoji picker panel - using EMOJI_FONT for rendering
+        // Emoji picker
         let emoji_picker: Element<Message> = if self.show_emoji_picker {
             let emojis = ["😀", "😂", "😢", "😎", "🤔", "❤️", "👍", "👎", 
                           "🔥", "⭐", "🎉", "👋", "✅", "❌", "💯", "🙏"];
@@ -2230,7 +2626,7 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
-        // Discord-style :emoji: suggestions dropdown
+        // Suggestions
         let emoji_suggestions_panel: Element<Message> = if !self.emoji_suggestions.is_empty() {
             let suggestion_items: Vec<Element<Message>> = self.emoji_suggestions.iter().map(|(name, emoji)| {
                 button(
@@ -2250,16 +2646,12 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
-        // Simple chat header with status and Add Contact button
-        // Show button if connected but peer not in contacts
+        // Header
         let peer_name = self.peer_username.clone().unwrap_or_else(|| "Unknown".to_string());
         let peer_in_contacts = self.contacts.iter().any(|c| c.name == peer_name);
         
         let add_contact_btn: Element<Message> = if self.recipient_key_imported && !peer_in_contacts {
-            button(text(format!("+ Add {}", peer_name)).size(10))
-                .padding([4, 8])
-                .on_press(Message::AddToContacts)
-                .into()
+            button(text(format!("+ Add {}", peer_name)).size(10)).padding([4, 8]).on_press(Message::AddToContacts).into()
         } else {
             Space::with_width(0).into()
         };
@@ -2272,7 +2664,7 @@ impl CryptoChat {
             text(&self.status).size(10)
         ].padding(10);
         
-        let chat_area = column![
+        let chat_view = column![
             container(header_content),
             messages_view,
             typing_indicator,
@@ -2281,31 +2673,22 @@ impl CryptoChat {
             input_area,
         ].width(Length::Fill).height(Length::Fill);
         
-        // Settings modal overlay
-        let settings_modal: Element<Message> = if self.show_settings {
-            let tab_buttons = row![
-                button(text("Solid").size(12))
-                    .padding([6, 12])
-                    .on_press(Message::SetSettingsTab(0)),
-                button(text("Gradient").size(12))
-                    .padding([6, 12])
-                    .on_press(Message::SetSettingsTab(1)),
-                button(text("Rainbow").size(12))
-                    .padding([6, 12])
-                    .on_press(Message::SetSettingsTab(2)),
+        // Settings modal
+        if self.show_settings {
+             let tab_buttons = row![
+                button(text("Solid").size(12)).padding([6, 12]).on_press(Message::SetSettingsTab(0)),
+                button(text("Gradient").size(12)).padding([6, 12]).on_press(Message::SetSettingsTab(1)),
+                button(text("Rainbow").size(12)).padding([6, 12]).on_press(Message::SetSettingsTab(2)),
             ].spacing(4);
             
-            // Preview: show color as text instead of styled container
             let preview_text = match &self.color_prefs.bubble_style {
                 color_store::BubbleStyle::Solid { color } => format!("Preview: {}", color),
                 color_store::BubbleStyle::Gradient { color1, color2 } => format!("Gradient: {} → {}", color1, color2),
                 color_store::BubbleStyle::Rainbow { speed } => format!("🌈 Rainbow (speed: {:.1}x)", speed),
             };
             
-            // Tab content based on selected tab
             let tab_content: Element<Message> = match self.settings_tab {
                 0 => {
-                    // Solid color: Hue presets
                     column![
                         text("Hue").size(11),
                         text(format!("Current: {:.0}°", self.color_prefs.hue)).size(10),
@@ -2323,7 +2706,6 @@ impl CryptoChat {
                     ].spacing(8).into()
                 }
                 1 => {
-                    // Gradient: two color pickers
                     column![
                         text("Color 1 (start):").size(11),
                         row![
@@ -2344,7 +2726,6 @@ impl CryptoChat {
                     ].spacing(8).into()
                 }
                 _ => {
-                    // Rainbow: speed control
                     column![
                         text("🌈 Rainbow Mode").size(14).font(EMOJI_FONT),
                         text("Bubbles cycle through colors!").size(11),
@@ -2366,6 +2747,15 @@ impl CryptoChat {
                 tab_buttons,
                 text(&preview_text).size(12),
                 tab_content,
+                text("Incoming Bubble Color:").size(12),
+                row![
+                    button(text("⚪ Default")).padding([4, 8]).on_press(Message::SetTheirBubbleColor("#2a2a2e".to_string())),
+                    button(text("🔴").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#d11a1e".to_string())),
+                    button(text("🔵").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#2c7be5".to_string())),
+                    button(text("🟢").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#32b432".to_string())),
+                    button(text("🟣").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#9b59b6".to_string())),
+                    button(text("⚫").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#000000".to_string())),
+                ].spacing(8),
                 row![
                     button(text("Cancel")).padding([6, 16]).on_press(Message::ToggleSettings),
                     Space::with_width(Length::Fill),
@@ -2375,15 +2765,7 @@ impl CryptoChat {
             
             container(modal).width(Length::Fill).height(Length::Fill).center_x().center_y().into()
         } else {
-            Space::with_height(0).into()
-        };
-        
-        // If settings modal is open, show it as the main content with sidebar
-        // Otherwise show normal chat
-        if self.show_settings {
-            row![sidebar, settings_modal].width(Length::Fill).height(Length::Fill).into()
-        } else {
-            row![sidebar, chat_area].width(Length::Fill).height(Length::Fill).into()
+            chat_view.into()
         }
     }
     
@@ -2429,14 +2811,41 @@ impl CryptoChat {
             ].spacing(3).into()
         } else {
             // Regular text message - use EMOJI_FONT for emoji support
-            column![
+            let mut content_col = column![
                 text(&name_label).size(11),
                 text(&msg.content).size(14).font(EMOJI_FONT),
+            ];
+            
+            // Render custom emotes below
+            if !msg.emotes.is_empty() {
+                let mut ordered_emotes = Vec::new();
+                for (name, hash) in &msg.emotes {
+                    let pattern = format!(":{}:", name);
+                    if let Some(idx) = msg.content.find(&pattern) {
+                         ordered_emotes.push((idx, hash));
+                    }
+                }
+                ordered_emotes.sort_by_key(|(idx, _)| *idx);
+                
+                let mut emotes_row = row![].spacing(6);
+                for (_, hash) in ordered_emotes {
+                    if let Some(path) = self.emote_manager.get_emote_path(hash) {
+                        emotes_row = emotes_row.push(
+                             iced::widget::Image::new(path)
+                                 .width(Length::Fixed(32.0))
+                                 .height(Length::Fixed(32.0))
+                        );
+                    }
+                }
+                content_col = content_col.push(emotes_row);
+            }
+            
+            content_col.push(
                 row![
                     text(&msg.timestamp).size(9),
                     text(status_indicator).size(9),
-                ].spacing(4),
-            ].spacing(3).into()
+                ].spacing(4)
+            ).spacing(3).into()
         };
         
         // Build bubble appearance
@@ -2455,24 +2864,33 @@ impl CryptoChat {
         
         let bubble = container(bubble_content)
             .padding([10, 16])
+            .max_width(500) // Max width for responsive layout
             .style(bubble_style);
         
         // Build reactions display row (if any reactions exist)
+        // Discord-style: group same emojis and show count as pills
         let reactions_display: Element<Message> = if !msg.reactions.is_empty() {
-            // Group and count reactions
-            let reaction_text: String = msg.reactions.iter()
-                .map(|(emoji, _)| emoji.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            text(reaction_text).size(16).font(EMOJI_FONT).into()
+            // Group reactions by emoji and count
+            let mut emoji_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for (emoji, _) in &msg.reactions {
+                *emoji_counts.entry(emoji.as_str()).or_insert(0) += 1;
+            }
+            
+            // Create pill buttons for each emoji+count
+            let pills: Vec<Element<Message>> = emoji_counts.iter().map(|(emoji, count)| {
+                // Always show count like Discord (e.g. "❤️ 1")
+                let label = format!("{} {}", emoji, count);
+                
+                container(text(label).size(12).font(EMOJI_FONT))
+                    .padding([4, 8]) // Slightly more padding
+                    .style(theme::reaction_pill)
+                    .into()
+            }).collect();
+            
+            row(pills).spacing(4).into()
         } else {
             Space::with_height(0).into()
         };
-        
-        // Small reaction button (+)
-        let react_btn = button(text("😀").font(EMOJI_FONT).size(12))
-            .padding([2, 6])
-            .on_press(Message::ShowReactionPicker(msg_index));
         
         // Reaction picker (if open for this message)
         let picker: Element<Message> = if self.reaction_picker_for_msg == Some(msg_index) {
@@ -2495,25 +2913,23 @@ impl CryptoChat {
             picker,
         ].spacing(2);
         
+        // Wrap with mouse_area for right-click reaction picker
+        let bubble_interactive = mouse_area(bubble_with_reactions)
+            .on_right_press(Message::ShowReactionPicker(msg_index));
+        
         // Use row with spacers for better visual balance
         // Mine: small space | bubble | no space (right side)
         // Theirs: no space | bubble | small space (left side)
         if msg.is_mine {
             row![
                 Space::with_width(Length::FillPortion(1)), // Left spacer (takes remaining space)
-                column![
-                    row![react_btn, Space::with_width(4)].align_items(iced::Alignment::End),
-                    bubble_with_reactions,
-                ].align_items(iced::Alignment::End),
+                bubble_interactive,
             ]
             .width(Length::Fill)
             .into()
         } else {
             row![
-                column![
-                    bubble_with_reactions,
-                    row![Space::with_width(4), react_btn],
-                ],
+                bubble_interactive,
                 Space::with_width(Length::FillPortion(1)), // Right spacer
             ]
             .width(Length::Fill)

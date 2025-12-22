@@ -16,6 +16,8 @@ pub enum NetworkEvent {
     MessageReceived { 
         encrypted_payload: String,
         sender_name: Option<String>,
+        sender_fingerprint: String,
+        sender_address: String,
     },
     RequestReceived {
         sender_fingerprint: String,
@@ -25,14 +27,20 @@ pub enum NetworkEvent {
     },
     TypingUpdate {
         is_typing: bool,
+        sender_fingerprint: String,
+        sender_address: String,
     },
     ReadReceiptReceived {
         last_read_timestamp: String,
+        sender_fingerprint: String,
+        sender_address: String,
     },
     FileReceived {
         filename: String,
         encrypted_data: String,
         sender_name: Option<String>,
+        sender_fingerprint: String,
+        sender_address: String,
     },
     ContactRemovalReceived {
         fingerprint: String,
@@ -76,6 +84,20 @@ pub enum NetworkEvent {
         msg_timestamp: String,
         emoji: String,
         sender_name: String,
+        sender_fingerprint: String,
+        sender_address: String,
+    },
+
+    /// Received emote request
+    EmoteRequestReceived {
+        hash: String,
+        sender_addr_raw: String,
+    },
+
+    /// Received emote data
+    EmoteDataReceived {
+        hash: String,
+        data: String,
     },
     
     Error(String),
@@ -100,15 +122,31 @@ pub enum MessageEnvelope {
     RegularMessage {
         encrypted_payload: String,
         sender_name: Option<String>,
+        sender_fingerprint: String,
+        sender_listening_port: u16,
     },
     /// Typing indicator (true = started typing, false = stopped)
     TypingIndicator {
         is_typing: bool,
+        sender_fingerprint: String,
+        sender_listening_port: u16,
     },
     /// Read receipt for message acknowledgment  
     ReadReceipt {
         /// Timestamp of the last read message
         last_read_timestamp: String,
+        sender_fingerprint: String,
+        sender_listening_port: u16,
+    },
+    /// Request a custom emote image by hash
+    EmoteRequest {
+        hash: String,
+    },
+    /// Transfer custom emote image data
+    EmoteData {
+        hash: String,
+        /// Base64 encoded image data
+        data: String,
     },
     /// Encrypted file transfer
     FileMessage {
@@ -116,6 +154,8 @@ pub enum MessageEnvelope {
         /// Base64-encoded encrypted file data
         encrypted_data: String,
         sender_name: Option<String>,
+        sender_fingerprint: String,
+        sender_listening_port: u16,
     },
     /// Contact removal notification
     ContactRemoved {
@@ -202,6 +242,8 @@ pub enum MessageEnvelope {
         emoji: String,
         /// Who sent the reaction
         sender_name: String,
+        sender_fingerprint: String,
+        sender_listening_port: u16,
     },
 }
 
@@ -284,6 +326,9 @@ impl NetworkHandle {
 }
 
 fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<NetworkEvent>, peer_addr: &str) -> Result<()> {
+    // Extract IP for use in sender_address fields
+    let ip = peer_addr.split(':').next().unwrap_or("127.0.0.1").to_string();
+
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes)?;
     let len = u32::from_be_bytes(len_bytes) as usize;
@@ -310,20 +355,48 @@ fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<Netw
                 sender_name,
             });
         }
-        MessageEnvelope::RegularMessage { encrypted_payload, sender_name } => {
-            let _ = sender.send(NetworkEvent::MessageReceived { encrypted_payload, sender_name });
+        MessageEnvelope::RegularMessage { encrypted_payload, sender_name, sender_fingerprint, sender_listening_port } => {
+            let _ = sender.send(NetworkEvent::MessageReceived { 
+                encrypted_payload, 
+                sender_name, 
+                sender_fingerprint,
+                sender_address: format!("{}:{}", ip, sender_listening_port),
+            });
         }
-        MessageEnvelope::TypingIndicator { is_typing } => {
-            let _ = sender.send(NetworkEvent::TypingUpdate { is_typing });
+        MessageEnvelope::TypingIndicator { is_typing, sender_fingerprint, sender_listening_port } => {
+            let _ = sender.send(NetworkEvent::TypingUpdate { 
+                is_typing, 
+                sender_fingerprint,
+                sender_address: format!("{}:{}", ip, sender_listening_port),
+            });
         }
-        MessageEnvelope::ReadReceipt { last_read_timestamp } => {
-            let _ = sender.send(NetworkEvent::ReadReceiptReceived { last_read_timestamp });
+        MessageEnvelope::ReadReceipt { last_read_timestamp, sender_fingerprint, sender_listening_port } => {
+            let _ = sender.send(NetworkEvent::ReadReceiptReceived { 
+                last_read_timestamp, 
+                sender_fingerprint,
+                sender_address: format!("{}:{}", ip, sender_listening_port),
+            });
         }
-        MessageEnvelope::FileMessage { filename, encrypted_data, sender_name } => {
-            let _ = sender.send(NetworkEvent::FileReceived { filename, encrypted_data, sender_name });
+        MessageEnvelope::FileMessage { filename, encrypted_data, sender_name, sender_fingerprint, sender_listening_port } => {
+            let _ = sender.send(NetworkEvent::FileReceived { 
+                filename, 
+                encrypted_data, 
+                sender_name, 
+                sender_fingerprint,
+                sender_address: format!("{}:{}", ip, sender_listening_port),
+            });
         }
         MessageEnvelope::ContactRemoved { fingerprint } => {
             let _ = sender.send(NetworkEvent::ContactRemovalReceived { fingerprint });
+        }
+        MessageEnvelope::Reaction { msg_timestamp, emoji, sender_name, sender_fingerprint, sender_listening_port } => {
+            let _ = sender.send(NetworkEvent::ReactionReceived {
+                msg_timestamp,
+                emoji,
+                sender_name,
+                sender_fingerprint,
+                sender_address: format!("{}:{}", ip, sender_listening_port),
+            });
         }
 
         // Group Messages
@@ -367,13 +440,18 @@ fn handle_connection(stream: &mut TcpStream, sender: &mpsc::UnboundedSender<Netw
             });
         }
         
-        MessageEnvelope::Reaction { msg_timestamp, emoji, sender_name } => {
-            let _ = sender.send(NetworkEvent::ReactionReceived {
-                msg_timestamp,
-                emoji,
-                sender_name,
+        MessageEnvelope::EmoteRequest { hash } => {
+            let _ = sender.send(NetworkEvent::EmoteRequestReceived {
+                hash,
+                sender_addr_raw: peer_addr.to_string(),
             });
         }
+        
+        MessageEnvelope::EmoteData { hash, data } => {
+            let _ = sender.send(NetworkEvent::EmoteDataReceived { hash, data });
+        }
+        
+
         
         _ => {}
     }

@@ -31,6 +31,12 @@ pub struct ColorPreferences {
     pub bubble_style: BubbleStyle,
     pub hue: f32,        // 0.0 - 360.0
     pub saturation: f32, // 0.0 - 1.0
+    #[serde(default = "default_their_color")]
+    pub their_bubble_color: String, // Hex string for incoming messages
+}
+
+fn default_their_color() -> String {
+    "#2a2a2e".to_string() // Default gray
 }
 
 impl Default for ColorPreferences {
@@ -39,6 +45,7 @@ impl Default for ColorPreferences {
             bubble_style: BubbleStyle::default(),
             hue: 210.0,      // Blue hue
             saturation: 0.8, // High saturation
+            their_bubble_color: default_their_color(),
         }
     }
 }

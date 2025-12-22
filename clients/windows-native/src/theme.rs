@@ -84,9 +84,14 @@ pub fn my_bubble() -> iced::widget::container::Appearance {
 
 /// Their message bubble style
 pub fn their_bubble() -> iced::widget::container::Appearance {
+    let packed = THEIR_BUBBLE_COLOR.load(Ordering::Relaxed);
+    let r = ((packed >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((packed >> 8) & 0xFF) as f32 / 255.0;
+    let b = (packed & 0xFF) as f32 / 255.0;
+
     iced::widget::container::Appearance {
-        background: Some(iced::Background::Color(colors::BUBBLE_THEIRS)),
-        text_color: Some(colors::TEXT_PRIMARY),
+        background: Some(iced::Background::Color(Color::from_rgb(r, g, b))),
+        text_color: Some(text_color_for_bg(r, g, b)),
         border: iced::Border {
             radius: 16.0.into(),
             ..Default::default()
@@ -118,11 +123,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static CUSTOM_BUBBLE_COLOR: AtomicU32 = AtomicU32::new(0x2c7be5); // Default blue
 // Second color for gradient mode
 static GRADIENT_COLOR_2: AtomicU32 = AtomicU32::new(0x9b59b6); // Default purple
+// Static storage for "their" bubble color
+static THEIR_BUBBLE_COLOR: AtomicU32 = AtomicU32::new(0x2a2a2e); // Default dark gray
 
 /// Set the custom bubble color from RGB floats
 pub fn set_bubble_color(r: f32, g: f32, b: f32) {
     let packed = ((r * 255.0) as u32) << 16 | ((g * 255.0) as u32) << 8 | (b * 255.0) as u32;
     CUSTOM_BUBBLE_COLOR.store(packed, Ordering::Relaxed);
+}
+
+/// Set "their" bubble color from RGB floats
+pub fn set_their_bubble_color(r: f32, g: f32, b: f32) {
+    let packed = ((r * 255.0) as u32) << 16 | ((g * 255.0) as u32) << 8 | (b * 255.0) as u32;
+    THEIR_BUBBLE_COLOR.store(packed, Ordering::Relaxed);
 }
 
 /// Set the gradient second color
@@ -190,3 +203,17 @@ pub fn my_bubble_gradient2() -> iced::widget::container::Appearance {
         },
     }
 }
+
+/// Style for reaction pills (small buttons below message)
+pub fn reaction_pill(_theme: &iced::Theme) -> iced::widget::container::Appearance {
+    iced::widget::container::Appearance {
+        background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.20))), // Slightly lighter than bg
+        text_color: Some(Color::WHITE),
+        border: iced::Border {
+            radius: 12.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+

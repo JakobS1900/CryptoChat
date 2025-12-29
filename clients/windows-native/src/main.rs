@@ -2539,7 +2539,7 @@ impl CryptoChat {
 
             column![
                  row![
-                     text("🗂️ GROUPS").size(11).font(EMOJI_FONT).style(iced::theme::Text::Color(theme::colors::ACCENT_SECONDARY)),
+                     text("GROUPS").size(11).style(iced::theme::Text::Color(theme::colors::ACCENT_SECONDARY)),
                      Space::with_width(Length::Fill),
                      button(text("+ New").size(9)).padding([3, 8]).on_press(Message::CreateGroup),
                  ].align_items(iced::Alignment::Center),
@@ -2565,7 +2565,7 @@ impl CryptoChat {
         // App header
         let app_header = container(
             column![
-                text("🔐 CryptoChat").size(18).font(EMOJI_FONT),
+                text("CryptoChat").size(18),
                 text(format!("ID: {}...", fingerprint)).size(9).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
                 text(format!("Port: {}", port)).size(9).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
             ].spacing(2)
@@ -2591,7 +2591,7 @@ impl CryptoChat {
              divider(),
              
              // Chats section
-             section_header("💬 CHATS"),
+             section_header("CHATS"),
              chats_list,
              Space::with_height(6),
              
@@ -2600,14 +2600,14 @@ impl CryptoChat {
              divider(),
              
              // Contacts section
-             section_header("👥 CONTACTS"),
+             section_header("CONTACTS"),
              contacts_section,
              Space::with_height(6),
 
              // Groups section  
              groups_section,
              
-             Space::with_height(Length::Fill),
+             Space::with_height(16),
              
              // Bottom action bar
              divider(),
@@ -2622,13 +2622,19 @@ impl CryptoChat {
     fn view_chat(&self) -> Element<Message> {
         // Chat bubbles
         let messages_view: Element<Message> = if self.get_active_messages().is_empty() {
+            // Modern empty state with visual hierarchy
             container(
                 column![
-                    text("How to connect:").size(14),
-                    text("1. Set your username in the sidebar").size(12),
-                    text("2. Share your key with a peer").size(12),
-                    text("3. Import their key").size(12),
-                    text("4. Select the chat to start messaging!").size(12),
+                    text("💬").size(48).font(EMOJI_FONT),
+                    Space::with_height(16),
+                    text("Start Chatting!").size(20).style(iced::theme::Text::Color(theme::colors::TEXT_PRIMARY)),
+                    Space::with_height(12),
+                    text("Quick Start:").size(12).style(iced::theme::Text::Color(theme::colors::ACCENT_SECONDARY)),
+                    Space::with_height(8),
+                    text("1. Set your username in the sidebar").size(12).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
+                    text("2. Copy your key and share it with a friend").size(12).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
+                    text("3. Import their key when they share theirs").size(12).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
+                    text("4. Select the chat and start messaging!").size(12).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
                 ].spacing(4).align_items(iced::Alignment::Center)
             ).width(Length::Fill).height(Length::Fill).center_x().center_y().into()
         } else {
@@ -2814,32 +2820,66 @@ impl CryptoChat {
                 }
             };
             
+            // Styled modal with dark background
+            let modal_style: fn(&Theme) -> container::Appearance = |_| {
+                container::Appearance {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.08, 0.08, 0.14))),
+                    text_color: Some(Color::WHITE),
+                    border: iced::Border {
+                        color: Color::from_rgba(0.4, 0.3, 0.9, 0.4),
+                        width: 2.0,
+                        radius: 12.0.into(),
+                    },
+                    shadow: iced::Shadow {
+                        color: Color::from_rgba(0.486, 0.227, 0.929, 0.3),
+                        offset: iced::Vector { x: 0.0, y: 4.0 },
+                        blur_radius: 20.0,
+                    },
+                }
+            };
+            
+            let modal_header = row![
+                text("Color Settings").size(18).style(iced::theme::Text::Color(theme::colors::TEXT_PRIMARY)),
+                Space::with_width(Length::Fill),
+                button(text("✕").size(14)).padding([4, 8]).on_press(Message::ToggleSettings),
+            ];
+            
             let modal = column![
-                row![
-                    text("Color Settings").size(16),
-                    Space::with_width(Length::Fill),
-                    button(text("✕").size(14)).padding(4).on_press(Message::ToggleSettings),
-                ],
+                modal_header,
+                Space::with_height(12),
                 tab_buttons,
-                text(&preview_text).size(12),
+                Space::with_height(8),
+                text(&preview_text).size(12).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
                 tab_content,
-                text("Incoming Bubble Color:").size(12),
+                Space::with_height(12),
+                text("Incoming Bubble Color:").size(12).style(iced::theme::Text::Color(theme::colors::ACCENT_SECONDARY)),
                 row![
-                    button(text("⚪ Default")).padding([4, 8]).on_press(Message::SetTheirBubbleColor("#2a2a2e".to_string())),
+                    button(text("Default")).padding([4, 8]).on_press(Message::SetTheirBubbleColor("#2a2a2e".to_string())),
                     button(text("🔴").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#d11a1e".to_string())),
                     button(text("🔵").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#2c7be5".to_string())),
                     button(text("🟢").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#32b432".to_string())),
                     button(text("🟣").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#9b59b6".to_string())),
                     button(text("⚫").font(EMOJI_FONT)).padding(4).on_press(Message::SetTheirBubbleColor("#000000".to_string())),
                 ].spacing(8),
+                Space::with_height(16),
                 row![
-                    button(text("Cancel")).padding([6, 16]).on_press(Message::ToggleSettings),
+                    button(text("Cancel")).padding([8, 20]).on_press(Message::ToggleSettings),
                     Space::with_width(Length::Fill),
-                    button(text("Save")).padding([6, 16]).on_press(Message::SaveColorPrefs),
+                    button(text("Save")).padding([8, 20]).on_press(Message::SaveColorPrefs),
                 ],
-            ].spacing(12).padding(16);
+            ].spacing(8).padding(24);
             
-            container(modal).width(Length::Fill).height(Length::Fill).center_x().center_y().into()
+            // Center the modal in a container with styled background
+            let modal_container = container(modal)
+                .style(modal_style)
+                .max_width(450);
+            
+            container(modal_container)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x()
+                .center_y()
+                .into()
         } else {
             chat_view.into()
         }

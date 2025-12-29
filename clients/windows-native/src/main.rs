@@ -17,7 +17,7 @@ mod conversation_store;
 use conversation::{ChatMessage, Conversation};
 
 use iced::widget::{button, column, container, row, text, text_input, scrollable, Space, mouse_area};
-use iced::{Application, Command, Element, Font, Length, Settings, Subscription, Theme, Background, Border, Color};
+use iced::{Application, Command, Element, Font, Length, Settings, Subscription, Theme, Color};
 use std::sync::{Arc, OnceLock, Mutex};
 use tokio::sync::mpsc;
 
@@ -681,12 +681,25 @@ impl Application for CryptoChat {
             Message::NetworkEvent(event) => {
                 match event {
                     network::NetworkEvent::MessageReceived { encrypted_payload, sender_name, sender_fingerprint, sender_address } => {
-                        match self.app_state.decrypt_message(&encrypted_payload) {
+                        // First, try to find sender's public key from contacts for decryption
+                        let sender_key = self.contacts.iter()
+                            .find(|c| c.fingerprint == sender_fingerprint)
+                            .map(|c| c.public_key.clone());
+                        
+                        // Try decryption: use sender key from contacts, or fall back to active recipient
+                        let decrypt_result = if let Some(ref key) = sender_key {
+                            self.app_state.decrypt_message_with_sender_key(&encrypted_payload, key)
+                        } else {
+                            // Fall back to current recipient (might fail if not active)
+                            self.app_state.decrypt_message(&encrypted_payload)
+                        };
+                        
+                        match decrypt_result {
                             Ok(plaintext) => {
                                 let name = sender_name.unwrap_or_else(|| 
                                     // Try to find name in contacts if sender_name is missing
                                     self.contacts.iter()
-                                        .find(|c| c.public_key.contains(&sender_fingerprint) || c.address.contains(&sender_fingerprint)) // Fuzzy fallback
+                                        .find(|c| c.fingerprint == sender_fingerprint)
                                         .map(|c| c.name.clone())
                                         .unwrap_or_else(|| {
                                              if Some(sender_fingerprint.clone()) == self.app_state.get_recipient_fingerprint() {
@@ -860,14 +873,14 @@ impl Application for CryptoChat {
                         }
                         Command::none()
                     }
-                    network::NetworkEvent::GroupInviteReceived { group_id, group_name, .. } => {
+                    network::NetworkEvent::GroupInviteReceived {  group_name, .. } => {
                         // TODO: Implement pending group invites
                         self.status = format!("Received invite to group: {}", group_name);
                         show_notification("New Group Invite", &format!("Invited to {}", group_name));
                         // Later: Add to pending_groups list
                         Command::none()
                     }
-                    network::NetworkEvent::GroupMessageReceived { group_id, sender_fingerprint, sender_name, encrypted_content, timestamp, .. } => {
+                    network::NetworkEvent::GroupMessageReceived { group_id,  sender_name, encrypted_content, timestamp, .. } => {
                         // Add received group message to chat
                         // Decrypt group message (TODO: Implement Group Encryption)
                         let new_msg = ChatMessage {
@@ -1827,12 +1840,33 @@ impl Application for CryptoChat {
             View::Onboarding => self.view_onboarding(),
             View::Chat => {
                 row![
-                    container(self.view_sidebar()).width(Length::Fixed(250.0)),
-                    container(self.view_chat()).width(Length::Fill)
+                    container(self.view_sidebar())
+                        .width(Length::Fixed(260.0))
+                        .height(Length::Fill),
+                    container(self.view_chat())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
                 ].into()
             },
         };
-        container(content).width(Length::Fill).height(Length::Fill).into()
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn theme(&self) -> Theme {
+        // Custom dark purple/cyan theme inspired by uiverse.io glassmorphism
+        Theme::custom(
+            "CryptoChat Dark".to_string(),
+            iced::theme::Palette {
+                background: Color::from_rgb(0.059, 0.059, 0.102),    // #0f0f1a - deep space purple
+                text: Color::from_rgb(0.949, 0.949, 0.969),          // #f2f2f7 - bright white
+                primary: Color::from_rgb(0.486, 0.227, 0.929),       // #7c3aed - vibrant purple
+                success: Color::from_rgb(0.134, 0.810, 0.514),       // #22cf83 - modern green
+                danger: Color::from_rgb(0.937, 0.267, 0.267),        // #ef4444 - soft red
+            }
+        )
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1861,14 +1895,6 @@ impl Application for CryptoChat {
             (Some(t), None) => Subscription::batch([network_sub, t]),
             (None, Some(r)) => Subscription::batch([network_sub, r]),
             (None, None) => network_sub,
-        }
-    }
-
-    fn theme(&self) -> Theme {
-        if self.dark_mode {
-            Theme::Dark
-        } else {
-            Theme::Light
         }
     }
 }
@@ -2849,17 +2875,17 @@ impl CryptoChat {
         };
         
         // Build bubble appearance
-        // Uses custom color from static storage (set on load and when saving preferences)
+        // Uses modern bubble styles with glow effects
         // For gradient mode: alternate between color1 (even) and color2 (odd)
         let is_gradient = matches!(&self.color_prefs.bubble_style, color_store::BubbleStyle::Gradient { .. });
         let bubble_style: fn(&Theme) -> container::Appearance = if msg.is_mine {
             if is_gradient && msg_index % 2 == 1 {
                 |_| theme::my_bubble_gradient2()
             } else {
-                |_| theme::my_bubble_custom()
+                |_| theme::modern_bubble_mine() // Enhanced with glow shadow
             }
         } else {
-            |_| theme::their_bubble()
+            |_| theme::modern_bubble_theirs() // Glass effect with border
         };
         
         let bubble = container(bubble_content)

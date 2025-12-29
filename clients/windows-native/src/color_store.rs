@@ -20,7 +20,7 @@ pub enum BubbleStyle {
 impl Default for BubbleStyle {
     fn default() -> Self {
         BubbleStyle::Solid {
-            color: "#2c7be5".to_string(), // Default blue
+            color: "#7c3aed".to_string(), // New accent purple
         }
     }
 }
@@ -36,14 +36,16 @@ pub struct ColorPreferences {
 }
 
 fn default_their_color() -> String {
-    "#2a2a2e".to_string() // Default gray
+    "#222240".to_string() // New surface color
 }
 
 impl Default for ColorPreferences {
     fn default() -> Self {
         Self {
-            bubble_style: BubbleStyle::default(),
-            hue: 210.0,      // Blue hue
+            bubble_style: BubbleStyle::Solid {
+                color: "#7c3aed".to_string(), // New accent purple
+            },
+            hue: 270.0,      // Purple hue
             saturation: 0.8, // High saturation
             their_bubble_color: default_their_color(),
         }

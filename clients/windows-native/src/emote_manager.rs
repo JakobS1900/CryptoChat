@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use sha2::{Sha256, Digest};
-use anyhow::{Result, Context};
+use anyhow::Result;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Emote {

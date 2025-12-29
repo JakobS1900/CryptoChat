@@ -17,7 +17,7 @@ use anyhow::{Result, Context, bail};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use qrcode::{QrCode, EcLevel};
-use image::{DynamicImage, Luma, ImageBuffer};
+use image::{Luma, ImageBuffer};
 use rqrr::PreparedImage;
 
 use cryptochat_crypto_core::pgp::PgpKeyPair;

@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::encrypted_storage;
 use anyhow::{Result, Context};
 use std::fs;
 

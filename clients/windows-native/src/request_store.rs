@@ -4,7 +4,7 @@
 //! to the local filesystem. In the future, this could be migrated to SQLite.
 
 use anyhow::{Context, Result};
-use cryptochat_messaging::requests::{MessageRequest, RequestStatus};
+use cryptochat_messaging::requests::MessageRequest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;

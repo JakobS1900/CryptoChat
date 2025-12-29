@@ -85,6 +85,23 @@ impl AppState {
         }
     }
 
+    /// Decrypt a message using the sender's public key directly (for multi-chat support)
+    /// This allows decrypting messages from any contact without requiring them to be "active"
+    pub fn decrypt_message_with_sender_key(&self, encrypted_base64: &str, sender_public_key: &str) -> anyhow::Result<String> {
+        let my_keypair = self.keypair.read().unwrap();
+        
+        match my_keypair.as_ref() {
+            Some(my_key) => {
+                // Parse the sender's public key to get their cert for signature verification
+                let sender_keypair = PgpKeyPair::from_public_key(sender_public_key)?;
+                let encrypted_bytes = base64::engine::general_purpose::STANDARD.decode(encrypted_base64)?;
+                let decrypted = my_key.decrypt_and_verify(sender_keypair.cert(), &encrypted_bytes)?;
+                Ok(String::from_utf8(decrypted)?)
+            }
+            None => anyhow::bail!("Own keypair not initialized"),
+        }
+    }
+
     /// Export keypair data for account migration (secret_key, public_key, fingerprint)
     pub fn get_keypair_for_export(&self) -> Option<(String, String, String)> {
         let keypair_guard = self.keypair.read().unwrap();

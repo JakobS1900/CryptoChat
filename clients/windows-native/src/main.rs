@@ -1873,8 +1873,12 @@ impl Application for CryptoChat {
         // Network polling
         let network_sub = iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::PollNetwork);
         
-        // Typing dots animation (when peer is typing)
-        let typing_sub = if self.peer_is_typing {
+        // Typing dots animation (when active conversation peer is typing)
+        let is_active_typing = self.active_conversation_id.as_ref()
+            .and_then(|id| self.conversations.get(id))
+            .map(|conv| conv.is_typing)
+            .unwrap_or(false);
+        let typing_sub = if is_active_typing {
             Some(iced::time::every(std::time::Duration::from_millis(400)).map(|_| Message::TypingDotsTick))
         } else {
             None
@@ -2597,9 +2601,14 @@ impl CryptoChat {
                 .into()
         };
         
-        // Typing indicator with animated dots
-        let typing_indicator: Element<Message> = if self.peer_is_typing {
-            let name = self.peer_username.as_deref().unwrap_or("Peer");
+        // Typing indicator with animated dots - check active conversation's typing state
+        let active_typing = self.active_conversation_id.as_ref()
+            .and_then(|id| self.conversations.get(id))
+            .map(|conv| (conv.is_typing, conv.name.clone()))
+            .unwrap_or((false, String::new()));
+        
+        let typing_indicator: Element<Message> = if active_typing.0 {
+            let name = &active_typing.1;
             let dots = match self.typing_dots_phase {
                 0 => "●  ",
                 1 => "● ●",

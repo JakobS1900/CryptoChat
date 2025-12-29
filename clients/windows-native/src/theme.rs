@@ -417,25 +417,25 @@ pub fn modern_bubble_mine() -> iced::widget::container::Appearance {
     }
 }
 
-/// Modern bubble for "their" messages - glass effect
+/// Modern bubble for "their" messages - enhanced glass effect with cyan accent
 pub fn modern_bubble_theirs() -> iced::widget::container::Appearance {
-    let packed = THEIR_BUBBLE_COLOR.load(Ordering::Relaxed);
-    let r = ((packed >> 16) & 0xFF) as f32 / 255.0;
-    let g = ((packed >> 8) & 0xFF) as f32 / 255.0;
-    let b = (packed & 0xFF) as f32 / 255.0;
+    // Use a slightly brighter base for better contrast
+    let base_r = 0.18;  // Brighter than default #222240
+    let base_g = 0.18;
+    let base_b = 0.28;  // Slight purple tint
     
     iced::widget::container::Appearance {
-        background: Some(iced::Background::Color(Color::from_rgb(r, g, b))),
-        text_color: Some(text_color_for_bg(r, g, b)),
+        background: Some(iced::Background::Color(Color::from_rgb(base_r, base_g, base_b))),
+        text_color: Some(colors::TEXT_PRIMARY),
         border: iced::Border {
-            color: colors::GLASS_BORDER,
-            width: 1.0,
+            color: Color::from_rgba(0.4, 0.7, 0.9, 0.3), // Cyan-ish border at 30% opacity
+            width: 1.5,
             radius: 18.0.into(),
         },
         shadow: iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
-            offset: iced::Vector { x: 0.0, y: 2.0 },
-            blur_radius: 8.0,
+            color: Color::from_rgba(0.024, 0.714, 0.831, 0.25), // Cyan glow at 25%
+            offset: iced::Vector { x: 0.0, y: 3.0 },
+            blur_radius: 10.0,
         },
     }
 }

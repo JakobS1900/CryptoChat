@@ -138,3 +138,7 @@ clients/windows-native/*.exe
 !.gitkeep
 !README.md
 !AGENTS.md
+clients/windows-native/build_error.txt
+clients/windows-native/check_output.txt
+clients/windows-native/check_output.txt
+clients/windows-native/err9.txt

@@ -2669,24 +2669,42 @@ impl CryptoChat {
             Space::with_height(0).into()
         };
         
-        // Input area
+        // Input area with styled container
         let can_send = self.recipient_key_imported || self.selected_group_id.is_some();
         let input_area: Element<Message> = if can_send {
+            // Action buttons row
             let action_bar: iced::widget::Row<'_, Message> = row![
-                button(text("📎").font(EMOJI_FONT)).padding(10).on_press(Message::PickFile),
-                button(text("✨").font(EMOJI_FONT)).padding(10).on_press(Message::UploadEmote),
-                button(text("[:] Emoji")).padding([6, 10]).on_press(Message::ToggleEmojiPicker),
-            ].spacing(8);
+                button(text("📎").font(EMOJI_FONT).size(16)).padding([8, 12]).on_press(Message::PickFile),
+                button(text("✨").font(EMOJI_FONT).size(16)).padding([8, 12]).on_press(Message::UploadEmote),
+                button(text("😊 Emoji").font(EMOJI_FONT).size(12)).padding([6, 10]).on_press(Message::ToggleEmojiPicker),
+            ].spacing(6);
             
+            // Message input with Send button
             let message_row: iced::widget::Row<'_, Message> = row![
                 text_input("Type a message...", &self.message_input)
                     .on_input(Message::MessageInputChanged)
                     .on_submit(Message::SendMessage)
-                    .padding(10).size(14),
-                button(text("Send")).padding([10, 16]).on_press(Message::SendMessage),
+                    .padding(12).size(14),
+                button(text("Send ▸").size(13)).padding([10, 20]).on_press(Message::SendMessage),
             ].spacing(8);
             
-            column![action_bar, message_row].spacing(6).padding(12).into()
+            // Wrap in styled container
+            let input_container_style: fn(&Theme) -> container::Appearance = |_| {
+                container::Appearance {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.06, 0.06, 0.10))),
+                    text_color: None,
+                    border: iced::Border {
+                        color: Color::from_rgba(0.3, 0.3, 0.5, 0.3),
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                }
+            };
+            
+            container(
+                column![action_bar, message_row].spacing(8).padding([10, 14])
+            ).width(Length::Fill).style(input_container_style).into()
         } else {
             Space::with_height(0).into()
         };

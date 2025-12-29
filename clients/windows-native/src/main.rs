@@ -2405,26 +2405,40 @@ impl CryptoChat {
         convs.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
         
         let chats_list: Element<Message> = if convs.is_empty() {
-            container(text("No active chats").size(12).style(iced::theme::Text::Color(iced::Color::from_rgb(0.7, 0.7, 0.7)))).padding(10).into()
+            container(text("No active chats").size(12).style(iced::theme::Text::Color(theme::colors::TEXT_MUTED))).padding(10).into()
         } else {
             column(
                 convs.iter().map(|c| {
                     let is_active = self.active_conversation_id.as_ref() == Some(&c.id);
-                    let btn_text = if c.unread_count > 0 {
-                        format!("{} ({})", c.name, c.unread_count) 
+                    
+                    // Build display text with typing indicator and unread count
+                    let typing_dot = if c.is_typing { " ●" } else { "" };
+                    let unread_badge = if c.unread_count > 0 { 
+                        format!(" ({})", c.unread_count) 
+                    } else { 
+                        String::new() 
+                    };
+                    let display_name = format!("{}{}{}", c.name, typing_dot, unread_badge);
+                    
+                    // Use styled container for active/inactive states
+                    let item_style: fn(&Theme) -> container::Appearance = if is_active {
+                        |_| theme::conversation_item_selected()
                     } else {
-                        c.name.clone()
+                        |_| theme::conversation_item()
                     };
                     
-                    let label = if is_active { format!("> {}", btn_text) } else { btn_text };
-                    
-                    button(text(label).size(12))
-                        .width(Length::Fill)
-                        .padding(8)
-                        .on_press(Message::SelectConversation(c.id.clone()))
-                        .into()
+                    button(
+                        container(text(display_name).size(12))
+                            .padding([8, 12])
+                            .width(Length::Fill)
+                            .style(item_style)
+                    )
+                    .width(Length::Fill)
+                    .padding(0)
+                    .on_press(Message::SelectConversation(c.id.clone()))
+                    .into()
                 }).collect::<Vec<_>>()
-            ).spacing(2).into()
+            ).spacing(4).into()
         };
 
         // --- 3. Requests ---
@@ -2530,50 +2544,82 @@ impl CryptoChat {
 
             column![
                  row![
-                     text("Groups:").size(10),
-                     button(text("+").size(10)).padding([2, 6]).on_press(Message::CreateGroup),
-                 ].spacing(4).align_items(iced::Alignment::Center),
+                     text("🗂️ GROUPS").size(11).font(EMOJI_FONT).style(iced::theme::Text::Color(theme::colors::ACCENT_SECONDARY)),
+                     Space::with_width(Length::Fill),
+                     button(text("+ New").size(9)).padding([3, 8]).on_press(Message::CreateGroup),
+                 ].align_items(iced::Alignment::Center),
                  groups_list,
+                 Space::with_height(6),
                  join_section
             ].spacing(4).into()
         };
 
         // --- Combine Sidebar ---
+        // Create styled section headers with cyan accent color and emoji support
+        let section_header = |title: &str| -> Element<Message> {
+            container(
+                text(title).size(11).font(EMOJI_FONT).style(iced::theme::Text::Color(theme::colors::ACCENT_SECONDARY))
+            ).padding([8, 0, 4, 0]).into()
+        };
+        
+        // Horizontal divider using Rule widget
+        let divider = || -> Element<Message> {
+            iced::widget::Rule::horizontal(1).into()
+        };
+        
+        // App header
+        let app_header = container(
+            column![
+                text("🔐 CryptoChat").size(18).font(EMOJI_FONT),
+                text(format!("ID: {}...", fingerprint)).size(9).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
+                text(format!("Port: {}", port)).size(9).style(iced::theme::Text::Color(theme::colors::TEXT_SECONDARY)),
+            ].spacing(2)
+        ).padding([12, 8]).width(Length::Fill);
+        
         let content = column![
-             text("CryptoChat").size(16).font(EMOJI_FONT),
-             text(format!("ID: {}...", fingerprint)).size(10),
-             text(format!("Port: {}", port)).size(10),
-             Space::with_height(10),
+             app_header,
+             Space::with_height(12),
              
+             // Identity section
              username_section,
-             Space::with_height(10),
+             Space::with_height(8),
              
-             text("Share:").size(10),
-             row![copy_btn, copy_qr_btn].spacing(4),
-             row![qr_btn].spacing(4),
-             Space::with_height(10),
+             // Share section
+             section_header("SHARE YOUR KEY"),
+             row![copy_btn, copy_qr_btn, qr_btn].spacing(4),
+             Space::with_height(8),
              
+             // Import section
+             section_header("IMPORT PEER KEY"),
              import_section,
-             Space::with_height(20),
              
-             text("Chats").size(14).font(EMOJI_FONT),
+             divider(),
+             
+             // Chats section
+             section_header("💬 CHATS"),
              chats_list,
-             Space::with_height(10),
+             Space::with_height(6),
              
              pending_section,
-             Space::with_height(10),
-
-             text("Contacts").size(12),
+             
+             divider(),
+             
+             // Contacts section
+             section_header("👥 CONTACTS"),
              contacts_section,
-             Space::with_height(10),
+             Space::with_height(6),
 
+             // Groups section  
              groups_section,
              
-             Space::with_height(20),
-             row![theme_btn, settings_btn, clear_btn].spacing(2),
+             Space::with_height(Length::Fill),
+             
+             // Bottom action bar
+             divider(),
+             row![theme_btn, settings_btn, clear_btn].spacing(4),
         ]
-        .spacing(4)
-        .padding(10);
+        .spacing(2)
+        .padding(12);
 
         scrollable(content).into()
     }

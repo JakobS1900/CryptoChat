@@ -46,6 +46,7 @@ rqrr = "0.7"
 # Utilities
 uuid = { version = "1.7", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+arboard = "3"
 
 # Symmetric encryption for chat storage
 aes-gcm = "0.10"

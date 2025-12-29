@@ -437,17 +437,26 @@ impl Application for CryptoChat {
                 Command::none()
             }
             Message::CopyKeyShare => {
-                if let (Ok(Some(stored_key)), Some(port)) = (keystore::load_keypair(), self.listening_port) {
-                    let key_share = network::KeyShareData {
-                        public_key: stored_key.public_key_armored.clone(),
-                        address: format!("127.0.0.1:{}", port),
-                        username: Some(self.my_username.clone()),
-                    };
-                    if let Ok(json) = serde_json::to_string(&key_share) {
-                        if copy_to_clipboard(&json).is_ok() {
-                            self.status = "Key share copied!".to_string();
+                // Use in-memory keypair from app_state instead of reloading from disk
+                match (self.app_state.get_keypair_for_export(), self.listening_port) {
+                    (Some((_, public_key, _)), Some(port)) => {
+                        let key_share = network::KeyShareData {
+                            public_key,
+                            address: format!("127.0.0.1:{}", port),
+                            username: Some(self.my_username.clone()),
+                        };
+                        match serde_json::to_string(&key_share) {
+                            Ok(json) => {
+                                match copy_to_clipboard(&json) {
+                                    Ok(()) => self.status = "✓ Key copied to clipboard!".to_string(),
+                                    Err(e) => self.status = format!("Clipboard error: {}", e),
+                                }
+                            }
+                            Err(e) => self.status = format!("JSON error: {}", e),
                         }
                     }
+                    (None, _) => self.status = "No keys in memory - try restarting".to_string(),
+                    (_, None) => self.status = "Network not ready (no port)".to_string(),
                 }
                 Command::none()
             }
@@ -1913,23 +1922,9 @@ fn chrono_time() -> String {
 }
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    use windows::Win32::System::DataExchange::*;
-    use windows::Win32::System::Memory::*;
-    use windows::Win32::Foundation::*;
-    use std::ptr;
-    unsafe {
-        if OpenClipboard(HWND(ptr::null_mut())).is_err() { return Err("Clipboard error".into()); }
-        let _ = EmptyClipboard();
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let hmem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).map_err(|_| "Alloc")?;
-        let ptr = GlobalLock(hmem);
-        if !ptr.is_null() {
-            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
-            GlobalUnlock(hmem);
-        }
-        SetClipboardData(13, HANDLE(hmem.0));
-        let _ = CloseClipboard();
-    }
+    // Use arboard crate for reliable cross-platform clipboard access
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("Clipboard init: {}", e))?;
+    clipboard.set_text(text.to_string()).map_err(|e| format!("Clipboard set: {}", e))?;
     Ok(())
 }
 
